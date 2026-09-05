@@ -45,6 +45,9 @@ const MASK_WIDTH = 256;
 // Soft edges come from a blur here rather than from bilinear magnification,
 // which would leave the silhouette visibly stepped at display resolution.
 const FEATHER = 2;
+// A mask is a slow-moving cue. Blending it across frames stops a dim scene
+// from making the lighting pop at every classification change.
+const TEMPORAL_BLEND = .3;
 
 /** Separable box blur, in place across `scratch`. Radius is small and fixed. */
 function feather(data: Uint8Array, scratch: Uint8Array, width: number, height: number) {
@@ -120,11 +123,14 @@ export async function createPersonSegmenter(
   let mask: PersonMask | null = null;
   let coverageScratch = new Uint8Array(0);
   let skinScratch = new Uint8Array(0);
+  let coverageHistory = new Uint8Array(0);
+  let skinHistory = new Uint8Array(0);
+  let hasHistory = false;
   let lastRun = -Infinity;
   // Segmentation is the slowest of the MediaPipe models and the silhouette is
   // the slowest-changing signal, so it runs on its own clock and backs off
   // further if a call turns out to be expensive on this machine.
-  let interval = 66;
+  let interval = 90;
   let failures = 0;
 
   return {
@@ -169,14 +175,26 @@ export async function createPersonSegmenter(
         };
         coverageScratch = new Uint8Array(pixels);
         skinScratch = new Uint8Array(pixels);
+        coverageHistory = new Uint8Array(pixels);
+        skinHistory = new Uint8Array(pixels);
+        hasHistory = false;
       }
       // Class 0 is background in both models; every other class is some part
       // of a person. Both masks are binary before feathering.
       for (let i = 0; i < pixels; i += 1) {
         const label = raw[i];
-        mask.data[i] = label > 0 ? 255 : 0;
-        mask.skin[i] = multiclass && SKIN_CLASSES.has(label) ? 255 : 0;
+        const coverage = label > 0 ? 255 : 0;
+        const skin = multiclass && SKIN_CLASSES.has(label) ? 255 : 0;
+        coverageHistory[i] = hasHistory
+          ? coverageHistory[i] + (coverage - coverageHistory[i]) * TEMPORAL_BLEND
+          : coverage;
+        skinHistory[i] = hasHistory
+          ? skinHistory[i] + (skin - skinHistory[i]) * TEMPORAL_BLEND
+          : skin;
+        mask.data[i] = coverageHistory[i];
+        mask.skin[i] = skinHistory[i];
       }
+      hasHistory = true;
       result.close();
       feather(mask.data, coverageScratch, width, maskHeight);
       if (multiclass) feather(mask.skin, skinScratch, width, maskHeight);
@@ -184,7 +202,7 @@ export async function createPersonSegmenter(
 
       const cost = performance.now() - started;
       if (cost > 14) interval = Math.min(interval * 1.35, 400);
-      else if (cost < 7) interval = Math.max(interval * .94, 60);
+      else if (cost < 7) interval = Math.max(interval * .94, 80);
       return mask;
     },
     destroy() {

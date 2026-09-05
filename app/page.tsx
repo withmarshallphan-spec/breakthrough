@@ -1,8 +1,8 @@
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { BookOpen, Clapperboard, Eye, EyeOff, Maximize, Minimize, SwitchCamera, Video } from 'lucide-react';
-import type { WaveEngine } from '@/lib/wave-engine';
+import { BookOpen, Bug, Clapperboard, Eye, EyeOff, Maximize, Minimize, SwitchCamera, Video } from 'lucide-react';
+import type { WaveDiagnosticStage, WaveEngine } from '@/lib/wave-engine';
 import type { FieldState, HandTracker } from '@/lib/hand-tracker';
 import { createQualityController, type QualityProfile } from '@/lib/quality';
 import {
@@ -39,6 +39,124 @@ function Symbols({ text }: { text: string }) {
 
 /** Every icon at the same size and hairline weight, so the set reads as one. */
 const ICON = { size: 16, strokeWidth: 1.25 } as const;
+
+type CameraCapabilities = MediaTrackCapabilities & {
+  exposureMode?: string[];
+  focusMode?: string[];
+  whiteBalanceMode?: string[];
+};
+
+type CameraConstraints = MediaTrackConstraints & {
+  exposureMode?: string;
+  focusMode?: string;
+  whiteBalanceMode?: string;
+};
+
+// iPadOS identifies itself as macOS in desktop-mode Safari, so touch support
+// is part of the test. This is deliberately a runtime toggle, not a build-time
+// branch: a camera-texture failure on any device can promote it to safe mode.
+const APPLE_TABLET = typeof navigator !== 'undefined' && (
+  /iPad|iPhone|iPod/.test(navigator.userAgent)
+  || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+);
+// Set by the manual diagnostic control or a failed runtime health check. Keep
+// this false by default so the ladder can reproduce and isolate an iPad issue.
+const IOS_SAFE_MODE = false;
+
+declare const __BUILD_ID__: string;
+
+const DIAGNOSTIC_STAGES: Array<{ id: WaveDiagnosticStage; label: string }> = [
+  { id: 'raw', label: '1 Raw video' },
+  { id: 'transparent', label: '2 Transparent canvas' },
+  { id: 'tracking', label: '3 Hand overlay' },
+  { id: 'wave', label: '4 Wave' },
+  { id: 'segmentation', label: '5 Segmentation' },
+  { id: 'depth', label: '6 Depth / refraction' },
+  { id: 'composite', label: '7 Final composite' },
+];
+
+type RuntimeDiagnostics = Record<string, string>;
+
+async function waitForVideoFrame(video: HTMLVideoElement) {
+  if (video.videoWidth < 1 || video.readyState < 2) {
+    await new Promise<void>((resolve) => {
+      const finish = () => {
+        video.removeEventListener('loadeddata', finish);
+        video.removeEventListener('playing', finish);
+        window.clearTimeout(timeout);
+        resolve();
+      };
+      const timeout = window.setTimeout(finish, 900);
+      video.addEventListener('loadeddata', finish, { once: true });
+      video.addEventListener('playing', finish, { once: true });
+    });
+  }
+
+  if (video.videoWidth > 0 && video.readyState >= 2 && 'requestVideoFrameCallback' in video) {
+    await new Promise<void>((resolve) => {
+      const timeout = window.setTimeout(resolve, 350);
+      video.requestVideoFrameCallback(() => {
+        window.clearTimeout(timeout);
+        resolve();
+      });
+    });
+  }
+}
+
+function nativeVideoHasPixels(video: HTMLVideoElement) {
+  if (video.videoWidth < 1 || video.videoHeight < 1 || video.readyState < 2) return false;
+  const probe = document.createElement('canvas');
+  probe.width = 8;
+  probe.height = 8;
+  const context = probe.getContext('2d', { willReadFrequently: true });
+  if (!context) return false;
+  try {
+    context.drawImage(video, 0, 0, probe.width, probe.height);
+    const pixels = context.getImageData(0, 0, probe.width, probe.height).data;
+    let brightPixels = 0;
+    for (let index = 0; index < pixels.length; index += 4) {
+      if (Math.max(pixels[index], pixels[index + 1], pixels[index + 2]) > 10) brightPixels += 1;
+    }
+    return brightPixels >= 3;
+  } catch {
+    return false;
+  }
+}
+
+async function cameraPipelineIsHealthy(video: HTMLVideoElement, engine: WaveEngine | null) {
+  await waitForVideoFrame(video);
+  // Check the decoded HTML frame first, then the exact WebGL VideoTexture path.
+  // Safari can satisfy the first check while producing a black GPU texture.
+  return video.videoWidth > 0
+    && video.readyState >= 2
+    && nativeVideoHasPixels(video)
+    && (engine ? engine.hasCameraTexturePixels() : true);
+}
+
+async function stabiliseCamera(track: MediaStreamTrack) {
+  const capabilities = track.getCapabilities?.() as CameraCapabilities | undefined;
+  if (!capabilities) return;
+
+  const continuous = (modes?: string[]) => modes?.includes('continuous') ? 'continuous' : undefined;
+  const constraints: CameraConstraints = {};
+  const exposureMode = continuous(capabilities.exposureMode);
+  const focusMode = continuous(capabilities.focusMode);
+  const whiteBalanceMode = continuous(capabilities.whiteBalanceMode);
+
+  if (exposureMode) constraints.exposureMode = exposureMode;
+  if (focusMode) constraints.focusMode = focusMode;
+  if (whiteBalanceMode) constraints.whiteBalanceMode = whiteBalanceMode;
+
+  // Unsupported camera controls are deliberately omitted. Browsers expose a
+  // different subset here, and an optional control must never block the feed.
+  if (Object.keys(constraints).length) {
+    try {
+      await track.applyConstraints(constraints);
+    } catch {
+      // The stream is already usable; retain it when a camera rejects tuning.
+    }
+  }
+}
 
 /**
  * The uncertainty meter's axis, in units of hbar. It starts at the bound the
@@ -78,6 +196,42 @@ export default function Home() {
   const [activeCameraId, setActiveCameraId] = useState('');
   const [switchingCamera, setSwitchingCamera] = useState(false);
   const [profile, setProfile] = useState<QualityProfile>(quality.profile);
+  const [rendererAvailable, setRendererAvailable] = useState(true);
+  const iosSafeModeRef = useRef(IOS_SAFE_MODE);
+  const [iosSafeMode, setIosSafeMode] = useState(IOS_SAFE_MODE);
+  const diagnosticStageRef = useRef<WaveDiagnosticStage>('composite');
+  const [diagnosticStage, setDiagnosticStage] = useState<WaveDiagnosticStage>('composite');
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const [diagnostics, setDiagnostics] = useState<RuntimeDiagnostics>({});
+
+  function enableIosSafeMode() {
+    iosSafeModeRef.current = true;
+    setIosSafeMode(true);
+    // This is intentionally independent of renderer availability. A healthy
+    // WebGL canvas can still have an unusable camera texture on iOS.
+    waveRef.current?.setCameraCompositing(false);
+    handTrackerRef.current?.setSafeMode(true);
+  }
+
+  function setRenderStage(stage: WaveDiagnosticStage) {
+    diagnosticStageRef.current = stage;
+    setDiagnosticStage(stage);
+    waveRef.current?.setDiagnosticStage(stage);
+    handTrackerRef.current?.setGuide(!filmMode && DIAGNOSTIC_STAGES.findIndex(({ id }) => id === stage) >= 2);
+  }
+
+  function toggleIosSafeMode() {
+    if (!iosSafeModeRef.current) {
+      enableIosSafeMode();
+      return;
+    }
+    iosSafeModeRef.current = false;
+    setIosSafeMode(false);
+    waveRef.current?.setCameraCompositing(diagnosticStageRef.current === 'composite');
+    // Rebuild optional stages from the live user gesture. Safe mode tears them
+    // down intentionally, so turning it off needs a fresh tracker instance.
+    if (streamRef.current) void startCamera(activeCameraId || undefined);
+  }
 
   useEffect(() => {
     let mounted = true;
@@ -86,10 +240,27 @@ export default function Home() {
       waveRef.current?.setProfile(next);
     });
 
+    const canvas = webglRef.current;
+    const fallBackToVideo = () => {
+      try {
+        waveRef.current?.destroy();
+      } catch {
+        // A lost graphics context cannot always dispose every GPU resource.
+      }
+      waveRef.current = null;
+      setRendererAvailable(false);
+    };
+    const onContextLost = (event: Event) => {
+      event.preventDefault();
+      fallBackToVideo();
+    };
+    canvas?.addEventListener('webglcontextlost', onContextLost);
+
     void import('@/lib/wave-engine').then(({ createWaveEngine }) => {
-      if (mounted && webglRef.current && videoRef.current) {
+      if (!mounted || !canvas || !videoRef.current) return;
+      try {
         waveRef.current = createWaveEngine(
-          webglRef.current,
+          canvas,
           videoRef.current,
           quality.profile,
           // The renderer measures; the controller decides. A sustained shortfall
@@ -97,7 +268,16 @@ export default function Home() {
           // same subscription, so the depth model and the segmenter shut down
           // without the pipeline being rebuilt.
           (fps) => quality.observe(fps),
+          { cameraCompositing: !iosSafeModeRef.current },
         );
+        waveRef.current.setDiagnosticStage(diagnosticStageRef.current);
+        if (videoRef.current.srcObject) {
+          void cameraPipelineIsHealthy(videoRef.current, waveRef.current).then((healthy) => {
+            if (mounted && !healthy) enableIosSafeMode();
+          });
+        }
+      } catch {
+        fallBackToVideo();
       }
     });
 
@@ -105,6 +285,8 @@ export default function Home() {
       if (event.metaKey || event.ctrlKey || event.altKey) return;
       if (event.target instanceof HTMLSelectElement || event.target instanceof HTMLInputElement) return;
       const key = event.key.toLowerCase();
+      if (key === 'i') return toggleIosSafeMode();
+      if (key === 'x') return setDiagnosticsOpen(current => !current);
       if (key === 'd') return handTrackerRef.current?.setDebug(event.shiftKey);
       if (key === 'escape') return setReaderOpen(false);
       if (key === 'n') return setReaderOpen(current => !current);
@@ -129,13 +311,48 @@ export default function Home() {
         setHands(0);
       }
     }, 250);
+    const diagnosticWatchdog = window.setInterval(() => {
+      const video = videoRef.current;
+      const track = streamRef.current?.getVideoTracks()[0];
+      const wave = waveRef.current?.getDiagnostics();
+      const tracker = handTrackerRef.current?.getDiagnostics();
+      const canvas = webglRef.current;
+      const settings = track?.getSettings();
+      const userAgent = navigator.userAgent;
+      const browser = /CriOS/.test(userAgent) ? 'Chrome iOS' : /FxiOS/.test(userAgent) ? 'Firefox iOS'
+        : /Safari/.test(userAgent) ? 'Safari' : /Chrome/.test(userAgent) ? 'Chrome' : 'Unknown';
+      setDiagnostics({
+        build: __BUILD_ID__,
+        platform: `${APPLE_TABLET ? 'Apple touch' : navigator.platform} / ${browser}`,
+        'video.readyState': String(video?.readyState ?? 0),
+        'video.videoWidth': String(video?.videoWidth ?? 0),
+        'video.videoHeight': String(video?.videoHeight ?? 0),
+        'video.paused': String(video?.paused ?? true),
+        'video.ended': String(video?.ended ?? false),
+        'track.readyState': track?.readyState ?? 'none',
+        'track.muted': String(track?.muted ?? false),
+        'camera resolution': settings?.width && settings.height ? `${settings.width} x ${settings.height}` : 'unknown',
+        dpr: String(window.devicePixelRatio),
+        'canvas CSS': canvas ? `${canvas.clientWidth} x ${canvas.clientHeight}` : 'none',
+        'canvas backing': canvas ? `${canvas.width} x ${canvas.height}` : 'none',
+        WebGL2: wave?.webgl2 ? 'yes' : 'no',
+        WebGPU: (navigator as Navigator & { gpu?: unknown }).gpu ? 'available' : 'no',
+        segmentation: tracker?.segmentation ? 'active' : 'off',
+        depth: tracker?.depth ? 'active' : 'off',
+        'webcam texture': wave?.cameraTextureInitialized ? 'initialized' : 'not initialized',
+        'render mode': wave?.cameraCompositing ? 'final composite' : 'native video + transparent overlay',
+        stage: wave?.diagnosticStage ?? diagnosticStageRef.current,
+      });
+    }, 400);
 
     return () => {
       mounted = false;
       stopWatching();
       window.clearInterval(watchdog);
+      window.clearInterval(diagnosticWatchdog);
       window.removeEventListener('keydown', onKey);
       document.removeEventListener('fullscreenchange', onFullscreen);
+      canvas?.removeEventListener('webglcontextlost', onContextLost);
       handTrackerRef.current?.destroy();
       waveRef.current?.destroy();
       streamRef.current?.getTracks().forEach((track) => track.stop());
@@ -155,15 +372,25 @@ export default function Home() {
           ...(deviceId ? { deviceId: { exact: deviceId } } : { facingMode: 'user' }),
           width: { ideal: 1280 },
           height: { ideal: 720 },
+          // A fixed, modest cadence avoids exposure hunting at 60 fps under
+          // indoor lighting and leaves enough time for MediaPipe to track.
+          frameRate: { ideal: 30, max: 30 },
         },
         audio: false,
       });
 
+      const [cameraTrack] = nextStream.getVideoTracks();
+      if (cameraTrack) await stabiliseCamera(cameraTrack);
+
       if (videoRef.current) {
+        videoRef.current.setAttribute('webkit-playsinline', 'true');
         videoRef.current.srcObject = nextStream;
         await videoRef.current.play();
         handTrackerRef.current?.destroy();
         handTrackerRef.current = null;
+        const pipelineHealthy = await cameraPipelineIsHealthy(videoRef.current, waveRef.current);
+        if (!pipelineHealthy) enableIosSafeMode();
+        else if (!iosSafeModeRef.current) waveRef.current?.setCameraCompositing(true);
       }
 
       previousStream?.getTracks().forEach((track) => track.stop());
@@ -204,9 +431,12 @@ export default function Home() {
             setFieldState(update.state);
             setTrackingLabel(update.label);
           }
-        }, quality);
+        }, quality, {
+          iosSafeMode: iosSafeModeRef.current,
+          onAdvancedStageFailure: enableIosSafeMode,
+        });
         tracker.setDebug(false);
-        tracker.setGuide(!filmMode);
+        tracker.setGuide(!filmMode && DIAGNOSTIC_STAGES.findIndex(({ id }) => id === diagnosticStageRef.current) >= 2);
         handTrackerRef.current = tracker;
       }
     } catch {
@@ -263,9 +493,12 @@ export default function Home() {
     <main
       ref={stageRef}
       className={`stage ${filmMode ? 'film-mode' : ''} ${interfaceHidden ? 'interface-hidden' : ''}`}
+      data-renderer={rendererAvailable ? 'webgl' : 'video'}
+      data-ios-safe-mode={iosSafeMode ? 'true' : 'false'}
+      data-diagnostic-stage={diagnosticStage}
       aria-label="Quantum confinement instrument"
     >
-      <video ref={videoRef} className="camera-feed" muted playsInline />
+      <video ref={videoRef} className="camera-feed" autoPlay muted playsInline />
       <canvas ref={webglRef} className="wave-canvas" aria-hidden="true" />
       <canvas ref={trackingRef} className="tracking-canvas" aria-hidden="true" />
       <output className="sr-only" aria-live="polite">{trackingLabel}</output>
@@ -371,6 +604,9 @@ export default function Home() {
       )}
 
       <nav className="tools" aria-label="Capture controls">
+        <button type="button" onClick={() => setDiagnosticsOpen(current => !current)} data-active={diagnosticsOpen} aria-label="Diagnostics" title="Diagnostics · X">
+          <Bug {...ICON} />
+        </button>
         {cameraState === 'live' && cameraDevices.length > 1 && (
           <label className="camera-picker" title="Camera source">
             <SwitchCamera {...ICON} aria-hidden="true" />
@@ -401,6 +637,24 @@ export default function Home() {
           {fullscreen ? <Minimize {...ICON} /> : <Maximize {...ICON} />}
         </button>
       </nav>
+      {diagnosticsOpen && (
+        <aside className="diagnostics" aria-label="Camera pipeline diagnostics">
+          <header>
+            <p className="meta">camera diagnostics</p>
+            <button type="button" onClick={toggleIosSafeMode} data-active={iosSafeMode}>I Safe mode</button>
+          </header>
+          <div className="diagnostic-stages" role="group" aria-label="Render stages">
+            {DIAGNOSTIC_STAGES.map(({ id, label }) => (
+              <button key={id} type="button" onClick={() => setRenderStage(id)} data-active={diagnosticStage === id}>{label}</button>
+            ))}
+          </div>
+          <dl>
+            {Object.entries(diagnostics).map(([label, value]) => (
+              <div key={label}><dt>{label}</dt><dd>{value}</dd></div>
+            ))}
+          </dl>
+        </aside>
+      )}
     </main>
   );
 }

@@ -69,8 +69,42 @@ button { font: inherit; color: inherit; }
 }
 
 .camera-feed { z-index: 0; object-fit: cover; transform: scaleX(-1); }
-.wave-canvas { z-index: 2; pointer-events: none; }
+.wave-canvas { z-index: 2; pointer-events: none; background: transparent; }
 .tracking-canvas { z-index: 3; pointer-events: none; }
+/* A live camera is more useful than a black canvas when a device cannot keep
+   the WebGL compositor alive. The tracking guide remains available above it. */
+.stage[data-renderer='video'] .wave-canvas { display: none; }
+.stage[data-diagnostic-stage='raw'] .wave-canvas { display: none; }
+
+.diagnostics {
+  position: absolute;
+  z-index: 12;
+  right: 22px;
+  bottom: 76px;
+  width: min(360px, calc(100vw - 32px));
+  max-height: min(72dvh, 680px);
+  overflow: auto;
+  padding: 14px;
+  border: 1px solid rgba(226, 236, 244, .26);
+  background: rgba(2, 5, 7, .92);
+  font-family: var(--font-caption);
+  font-size: .75rem;
+  text-transform: none;
+}
+.diagnostics header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.diagnostics .meta { margin: 0; }
+.diagnostics button { min-height: 32px; padding: 6px 9px; border: 1px solid var(--line-strong); background: transparent; }
+.diagnostics button[data-active='true'] { background: rgba(207, 225, 242, .17); border-color: var(--ice); }
+.diagnostic-stages { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin: 12px 0; }
+.diagnostic-stages button { text-align: left; }
+.diagnostics dl { display: grid; gap: 4px; margin: 0; }
+.diagnostics dl > div { display: grid; grid-template-columns: minmax(110px, 1fr) auto; gap: 12px; border-top: 1px solid rgba(226, 236, 244, .1); padding-top: 4px; }
+.diagnostics dt { color: var(--ink-3); }
+.diagnostics dd { margin: 0; color: var(--ink); text-align: right; }
+
+@media (max-width: 560px) {
+  .diagnostics { right: 16px; bottom: 68px; width: calc(100vw - 32px); }
+}
 
 /* --- Typography ------------------------------------------------------- */
 

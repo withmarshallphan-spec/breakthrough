@@ -17,7 +17,44 @@ export type WaveEngine = {
   setTracking: (tracking: FieldTracking) => void;
   /** Follow a tier change without rebuilding the pipeline. */
   setProfile: (profile: QualityProfile) => void;
+  /** Keep the native video visible and render only the field into the canvas. */
+  setCameraCompositing: (enabled: boolean) => void;
+  setDiagnosticStage: (stage: WaveDiagnosticStage) => void;
+  getDiagnostics: () => WaveEngineDiagnostics;
+  /** Tests the actual WebGL video texture, rather than only the HTML video. */
+  hasCameraTexturePixels: () => boolean;
   destroy: () => void;
+};
+
+export type WaveEngineOptions = {
+  /** iOS starts in overlay mode so the GPU can never hide the live camera. */
+  cameraCompositing?: boolean;
+};
+
+export type WaveDiagnosticStage =
+  | 'raw'
+  | 'transparent'
+  | 'tracking'
+  | 'wave'
+  | 'segmentation'
+  | 'depth'
+  | 'composite';
+
+export type WaveEngineDiagnostics = {
+  webgl2: boolean;
+  cameraTextureInitialized: boolean;
+  cameraCompositing: boolean;
+  diagnosticStage: WaveDiagnosticStage;
+};
+
+const DIAGNOSTIC_STAGE_ORDER: Record<WaveDiagnosticStage, number> = {
+  raw: 0,
+  transparent: 1,
+  tracking: 2,
+  wave: 3,
+  segmentation: 4,
+  depth: 5,
+  composite: 6,
 };
 
 // Standing modes remain pinned to the two boundaries. Fixed populations keep
@@ -381,6 +418,7 @@ const cameraFragmentShader = /* glsl */ `
   uniform vec2 uResolution;
   uniform vec2 uVideoSize;
   uniform float uEnergy;
+  uniform float uCameraCompositing;
   varying vec2 vUv;
 
   vec2 coverUv(vec2 uv) {
@@ -406,6 +444,10 @@ const cameraFragmentShader = /* glsl */ `
   const float ROOM_VIGNETTE = .24;
 
   void main() {
+    if (uCameraCompositing < .5) {
+      gl_FragColor = vec4(0.0);
+      return;
+    }
     vec3 color = texture2D(tVideo, coverUv(vUv)).rgb;
     float luma = dot(color, vec3(.299, .587, .114));
     color = mix(color, vec3(luma), ROOM_DESATURATE);
@@ -566,11 +608,12 @@ const compositeFragmentShader = /* glsl */ `
   uniform float uAmbient;
   uniform float uSeal;
   uniform float uHasOccluder;
+  uniform float uCameraCompositing;
   varying vec2 vUv;
 
   // How pronounced the inferred relief is. Higher shapes the subject harder
   // but starts turning albedo edges into fake geometry.
-  const float RELIEF = .45;
+  const float RELIEF = .24;
   // How hard the wave's own irradiance lights the room.
   // Calibrated against the measured buffer: a wide blur conserves energy, so
   // spreading the wave over the frame leaves irradiance around 0.01. The gain
@@ -618,6 +661,17 @@ const compositeFragmentShader = /* glsl */ `
   }
 
   void main() {
+    // Overlay mode never samples, grades, refracts, or relights the camera.
+    // It leaves the native video element responsible for the visible feed and
+    // composites only the field's own transparent light above it.
+    if (uCameraCompositing < .5) {
+      vec3 emission = texture2D(tEmissive, vUv).rgb;
+      vec3 halo = texture2D(tLight, vUv).rgb;
+      vec3 overlay = emission + halo * .46;
+      float alpha = clamp(max(max(overlay.r, overlay.g), overlay.b) * .72, 0.0, .92);
+      gl_FragColor = vec4(overlay, alpha);
+      return;
+    }
     float aspect = aspectOf();
     vec2 q = toSquare(vUv * 2.0 - 1.0, aspect);
     vec2 left = toSquare(uLeft, aspect);
@@ -671,7 +725,9 @@ const compositeFragmentShader = /* glsl */ `
     // --- Surface ----------------------------------------------------------
     // Hands and the head come with true geometric normals from the rig. Only
     // the rest of the room falls back to relief inferred from image brightness.
-    vec2 probe = uTexel * 5.0;
+    // A wider sample deliberately ignores sensor grain and small exposure
+    // changes. Those are not room geometry and should not steer the light.
+    vec2 probe = uTexel * 8.0;
     float lx = luma(texture2D(tEnvironment, vUv - vec2(probe.x, 0.0)).rgb);
     float rx = luma(texture2D(tEnvironment, vUv + vec2(probe.x, 0.0)).rgb);
     float dy = luma(texture2D(tEnvironment, vUv - vec2(0.0, probe.y)).rgb);
@@ -1172,14 +1228,28 @@ export function createWaveEngine(
   video: HTMLVideoElement,
   profile: QualityProfile,
   onFrameRate?: (fps: number) => void,
+  options: WaveEngineOptions = {},
 ): WaveEngine {
+  let requestedCameraCompositing = options.cameraCompositing ?? true;
+  let diagnosticStage: WaveDiagnosticStage = 'composite';
+  let cameraCompositing = requestedCameraCompositing;
   const renderer = new THREE.WebGLRenderer({
     canvas,
-    alpha: false,
+    // A transparent drawing buffer is the iOS escape hatch: the native video
+    // stays below it even when a camera texture cannot be sampled by WebGL.
+    alpha: true,
+    premultipliedAlpha: false,
     antialias: false,
     powerPreference: 'high-performance',
   });
-  renderer.setClearColor(0x010304, 1);
+  renderer.setClearColor(cameraCompositing ? 0x010304 : 0x000000, cameraCompositing ? 1 : 0);
+  // Older iPad GPUs can sample half-float textures but cannot render into
+  // them. Falling back to 8-bit buffers preserves the whole interaction,
+  // minus a little highlight headroom, instead of producing a black canvas.
+  const supportsHdrTargets = renderer.capabilities.isWebGL2
+    ? renderer.extensions.has('EXT_color_buffer_float')
+    : renderer.extensions.has('EXT_color_buffer_half_float');
+  const renderTargetType = supportsHdrTargets ? THREE.HalfFloatType : THREE.UnsignedByteType;
 
   const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, -2, 2);
   const envScene = new THREE.Scene();
@@ -1234,6 +1304,7 @@ export function createWaveEngine(
     uResolution: shared.uResolution,
     uVideoSize: { value: new THREE.Vector2(1280, 720) },
     uEnergy: shared.uEnergy,
+    uCameraCompositing: { value: cameraCompositing ? 1 : 0 },
   };
   const cameraMaterial = new THREE.ShaderMaterial({
     vertexShader: screenVertexShader,
@@ -1244,7 +1315,18 @@ export function createWaveEngine(
   });
   envScene.add(new THREE.Mesh(screenGeometry, cameraMaterial));
 
+  function updateCameraCompositing() {
+    cameraCompositing = requestedCameraCompositing && diagnosticStage === 'composite';
+    cameraUniforms.uCameraCompositing.value = cameraCompositing ? 1 : 0;
+    renderer.setClearColor(cameraCompositing ? 0x010304 : 0x000000, cameraCompositing ? 1 : 0);
+  }
+
   const environmentTarget = new THREE.WebGLRenderTarget(1, 1, {
+    minFilter: THREE.LinearFilter,
+    magFilter: THREE.LinearFilter,
+    depthBuffer: false,
+  });
+  const cameraProbeTarget = new THREE.WebGLRenderTarget(8, 8, {
     minFilter: THREE.LinearFilter,
     magFilter: THREE.LinearFilter,
     depthBuffer: false,
@@ -1410,14 +1492,14 @@ export function createWaveEngine(
 
   const emissiveTarget = new THREE.WebGLRenderTarget(1, 1, {
     // Preserve hot highlights through diffusion instead of clipping before bloom.
-    type: THREE.HalfFloatType,
+    type: renderTargetType,
     minFilter: THREE.LinearFilter,
     magFilter: THREE.LinearFilter,
     depthBuffer: false,
   });
   const visibleTarget = emissiveTarget.clone();
   const blurTargets = [0, 1].map(() => new THREE.WebGLRenderTarget(1, 1, {
-    type: THREE.HalfFloatType,
+    type: renderTargetType,
     minFilter: THREE.LinearFilter,
     magFilter: THREE.LinearFilter,
     depthBuffer: false,
@@ -1467,6 +1549,7 @@ export function createWaveEngine(
       uOccluderTexel: { value: occluderTexel },
       uLightTexel: { value: lightTexel },
       uHasOccluder: { value: 0 },
+      uCameraCompositing: cameraUniforms.uCameraCompositing,
     },
     depthTest: false,
     depthWrite: false,
@@ -1513,10 +1596,11 @@ export function createWaveEngine(
   particles.renderOrder = layerCount + 1;
   emissiveScene.add(particles);
 
-  const composer = new EffectComposer(renderer);
+  const composerTarget = new THREE.WebGLRenderTarget(1, 1, { type: renderTargetType });
+  const composer = new EffectComposer(renderer, composerTarget);
   composer.addPass(new RenderPass(mainScene, camera));
-  const bloomPass = new UnrealBloomPass(new THREE.Vector2(1, 1), .3, .4, .5);
-  composer.addPass(bloomPass);
+  const bloomPass = supportsHdrTargets ? new UnrealBloomPass(new THREE.Vector2(1, 1), .3, .4, .5) : null;
+  if (bloomPass) composer.addPass(bloomPass);
   const gradePass = new ShaderPass({
     // ShaderPass clones the uniforms it is handed, so this pass is fed
     // explicitly each frame rather than sharing objects with the scene.
@@ -1656,9 +1740,11 @@ export function createWaveEngine(
     gradePass.uniforms.uSeal.value = shared.uSeal.value;
     gradePass.uniforms.uCritical.value = currentCritical;
     gradePass.uniforms.uPresence.value = shared.uPresence.value;
-    bloomPass.strength = .22 + energy * .34 + currentSeal * .12 + currentPulse * .12
-      + currentCritical * .2;
-    bloomPass.radius = .58 + energy * .18;
+    if (bloomPass) {
+      bloomPass.strength = .22 + energy * .34 + currentSeal * .12 + currentPulse * .12
+        + currentCritical * .2;
+      bloomPass.radius = .58 + energy * .18;
+    }
   }
 
   /**
@@ -1901,7 +1987,7 @@ export function createWaveEngine(
    * spreading it evenly over hair and clothing, which reflect nothing like it.
    */
   function updatePersonMask(mask: FieldTracking['person'], bodyDepth: number) {
-    if (!mask) {
+    if (!mask || DIAGNOSTIC_STAGE_ORDER[diagnosticStage] < DIAGNOSTIC_STAGE_ORDER.segmentation) {
       personMesh.visible = false;
       return;
     }
@@ -1933,7 +2019,7 @@ export function createWaveEngine(
 
   /** Upload the aligned dense depth map, when the depth model is running. */
   function updateDepthMap(map: FieldTracking['depth']) {
-    if (!map) {
+    if (!map || DIAGNOSTIC_STAGE_ORDER[diagnosticStage] < DIAGNOSTIC_STAGE_ORDER.depth) {
       hasDepthUniform.value = 0;
       return;
     }
@@ -2026,7 +2112,7 @@ export function createWaveEngine(
     personMesh.visible = personWasVisible;
     personMaterial.uniforms.tPerson.value = personTextureWas;
     warmTexture.dispose();
-    renderer.setClearColor(0x010304, 1);
+    renderer.setClearColor(cameraCompositing ? 0x010304 : 0x000000, cameraCompositing ? 1 : 0);
     renderer.setRenderTarget(null);
   }
 
@@ -2046,9 +2132,20 @@ export function createWaveEngine(
     }
     updateAllUniforms(timer.getElapsed() * scale, delta);
 
-    renderer.setRenderTarget(environmentTarget);
-    renderer.clear();
-    renderer.render(envScene, camera);
+    if (diagnosticStage === 'raw' || diagnosticStage === 'transparent' || diagnosticStage === 'tracking') {
+      renderer.setClearColor(0x000000, 0);
+      renderer.setRenderTarget(null);
+      renderer.clear();
+      watchPerformance(now);
+      animationFrame = requestAnimationFrame(render);
+      return;
+    }
+
+    if (cameraCompositing) {
+      renderer.setRenderTarget(environmentTarget);
+      renderer.clear();
+      renderer.render(envScene, camera);
+    }
 
     // The rig is cleared to fully transparent so coverage reads as alpha.
     // Pass one is every surface in the scene, at its measured distance: it is
@@ -2113,9 +2210,11 @@ export function createWaveEngine(
     renderer.clear();
     renderer.render(emissiveScene, camera);
 
-    renderer.setClearColor(0x010304, 1);
+    renderer.setClearColor(cameraCompositing ? 0x010304 : 0x000000, cameraCompositing ? 1 : 0);
     renderer.setRenderTarget(null);
-    composer.render();
+    renderer.clear();
+    if (cameraCompositing) composer.render();
+    else renderer.render(mainScene, camera);
 
     watchPerformance(now);
     animationFrame = requestAnimationFrame(render);
@@ -2133,6 +2232,56 @@ export function createWaveEngine(
       if (next.particles < renderedParticleCount) {
         renderedParticleCount = next.particles;
         particleGeometry.setDrawRange(0, renderedParticleCount);
+      }
+    },
+    setCameraCompositing(enabled) {
+      requestedCameraCompositing = enabled;
+      updateCameraCompositing();
+    },
+    setDiagnosticStage(stage) {
+      diagnosticStage = stage;
+      updateCameraCompositing();
+      if (DIAGNOSTIC_STAGE_ORDER[stage] < DIAGNOSTIC_STAGE_ORDER.segmentation) updatePersonMask(null, .1);
+      if (DIAGNOSTIC_STAGE_ORDER[stage] < DIAGNOSTIC_STAGE_ORDER.depth) updateDepthMap(null);
+    },
+    getDiagnostics() {
+      return {
+        webgl2: renderer.capabilities.isWebGL2,
+        cameraTextureInitialized: videoTexture.image === video && video.videoWidth > 0,
+        cameraCompositing,
+        diagnosticStage,
+      };
+    },
+    hasCameraTexturePixels() {
+      if (destroyed || video.videoWidth < 1 || video.videoHeight < 1 || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+        return false;
+      }
+
+      const previousTarget = renderer.getRenderTarget();
+      const previousClearColor = renderer.getClearColor(new THREE.Color());
+      const previousClearAlpha = renderer.getClearAlpha();
+      const previousMode = cameraUniforms.uCameraCompositing.value;
+      const pixels = new Uint8Array(8 * 8 * 4);
+      try {
+        // The probe must use the same VideoTexture and shader path as normal
+        // compositing. A successful 2D drawImage is not enough on iOS.
+        cameraUniforms.uCameraCompositing.value = 1;
+        renderer.setRenderTarget(cameraProbeTarget);
+        renderer.setClearColor(0x000000, 1);
+        renderer.clear();
+        renderer.render(envScene, camera);
+        renderer.readRenderTargetPixels(cameraProbeTarget, 0, 0, 8, 8, pixels);
+        let brightPixels = 0;
+        for (let index = 0; index < pixels.length; index += 4) {
+          if (Math.max(pixels[index], pixels[index + 1], pixels[index + 2]) > 10) brightPixels += 1;
+        }
+        return brightPixels >= 3;
+      } catch {
+        return false;
+      } finally {
+        cameraUniforms.uCameraCompositing.value = previousMode;
+        renderer.setClearColor(previousClearColor, previousClearAlpha);
+        renderer.setRenderTarget(previousTarget);
       }
     },
     setTracking(tracking) {
@@ -2175,10 +2324,11 @@ export function createWaveEngine(
       window.removeEventListener('resize', resize);
       timer.disconnect();
       composer.dispose();
-      bloomPass.dispose();
+      bloomPass?.dispose();
       gradePass.dispose();
       videoTexture.dispose();
       environmentTarget.dispose();
+      cameraProbeTarget.dispose();
       screenGeometry.dispose();
       cameraMaterial.dispose();
       emissiveMaterial.dispose();

@@ -102,7 +102,20 @@ const CALLOUT_SWITCH_HYSTERESIS = 110;
 export type HandTracker = {
   setDebug: (enabled: boolean) => void;
   setGuide: (enabled: boolean) => void;
+  setSafeMode: (enabled: boolean) => void;
+  getDiagnostics: () => { segmentation: boolean; depth: boolean; safeMode: boolean };
   destroy: () => void;
+};
+
+export type HandTrackerOptions = {
+  /**
+   * Keep the iOS path to the one model it needs: hand landmarks. The optional
+   * face, segmentation, and neural-depth stages all feed advanced compositing
+   * and must not jeopardise the native camera fallback.
+  */
+  iosSafeMode?: boolean;
+  /** Lets the renderer move to native-video overlay mode if an optional stage fails. */
+  onAdvancedStageFailure?: () => void;
 };
 
 const connections = [
@@ -185,7 +198,9 @@ export async function createHandTracker(
   canvas: HTMLCanvasElement,
   onUpdate: (update: TrackingUpdate) => void,
   quality: QualityController,
+  { iosSafeMode = false, onAdvancedStageFailure }: HandTrackerOptions = {},
 ): Promise<HandTracker> {
+  let safeMode = iosSafeMode;
   const { FaceLandmarker, FilesetResolver, HandLandmarker } = await import('@mediapipe/tasks-vision');
   const vision = await FilesetResolver.forVisionTasks(
     'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm',
@@ -198,9 +213,11 @@ export async function createHandTracker(
     },
     runningMode: 'VIDEO' as const,
     numHands: 2,
-    minHandDetectionConfidence: 0.55,
-    minHandPresenceConfidence: 0.5,
-    minTrackingConfidence: 0.5,
+    // Low-light frames often contain a plausible but unstable hand. A small
+    // confidence increase rejects that noise before it can move the field.
+    minHandDetectionConfidence: 0.6,
+    minHandPresenceConfidence: 0.55,
+    minTrackingConfidence: 0.6,
   };
 
   let handLandmarker: Awaited<ReturnType<typeof HandLandmarker.createFromOptions>>;
@@ -217,7 +234,7 @@ export async function createHandTracker(
   // head simply stays out of the depth buffer, which is the old behaviour.
   let faceLandmarker: Awaited<ReturnType<typeof FaceLandmarker.createFromOptions>> | null = null;
   let faceTriangles: Uint16Array | null = null;
-  if (quality.profile.faceMesh) {
+  if (!safeMode && quality.profile.faceMesh) {
     try {
       faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
         baseOptions: {
@@ -238,7 +255,7 @@ export async function createHandTracker(
       faceTriangles = null;
     }
   }
-  if (!faceLandmarker) quality.disable('faceMesh');
+  if (!safeMode && !faceLandmarker) quality.disable('faceMesh');
 
   const drawingContext = canvas.getContext('2d');
   if (!drawingContext) throw new Error('2D canvas is unavailable');
@@ -262,14 +279,21 @@ export async function createHandTracker(
   // whenever the model arrives.
   let segmenter: PersonSegmenter | null = null;
   let personMask: PersonMask | null = null;
-  if (quality.profile.segmentation) {
+  if (!safeMode && quality.profile.segmentation) {
     void createPersonSegmenter(vision, quality.profile.multiclassSegmentation)
       .then((created) => {
-        if (destroyed) created?.destroy();
+        if (destroyed || safeMode) created?.destroy();
         else if (created) segmenter = created;
-        else quality.disable('segmentation');
+        else {
+          quality.disable('segmentation');
+          onAdvancedStageFailure?.();
+        }
       })
-      .catch(() => { segmenter = null; quality.disable('segmentation'); });
+      .catch(() => {
+        segmenter = null;
+        quality.disable('segmentation');
+        onAdvancedStageFailure?.();
+      });
   }
 
   // Dense depth is the last thing to arrive and the first thing to go. It only
@@ -278,14 +302,20 @@ export async function createHandTracker(
   let depthMap: DepthMap | null = null;
   let depthFit: AffineFit | null = null;
   const depthSamples: DepthSample[] = [];
-  if (quality.profile.denseDepth) {
+  if (!safeMode && quality.profile.denseDepth) {
     void createDepthEstimator()
       .then((created) => {
-        if (destroyed) created?.destroy();
+        if (destroyed || safeMode) created?.destroy();
         else if (created) depthEstimator = created;
-        else quality.disable('denseDepth');
+        else {
+          quality.disable('denseDepth');
+          onAdvancedStageFailure?.();
+        }
       })
-      .catch(() => quality.disable('denseDepth'));
+      .catch(() => {
+        quality.disable('denseDepth');
+        onAdvancedStageFailure?.();
+      });
   }
   quality.subscribe((profile) => {
     if (!profile.denseDepth && depthEstimator) {
@@ -332,8 +362,12 @@ export async function createHandTracker(
   let overlayMode: 'palms' | 'pinch' | 'none' = 'none';
   // Control points can be smoothed harder than the rig, which has to stay
   // glued to the fingers it is masking.
-  const controlFilters = new PointFilters(1.1, .009);
-  const rigFilters = new PointFilters(2.4, .022);
+  const controlFilters = new PointFilters(.85, .008);
+  const rigFilters = new PointFilters(1.45, .014);
+  // Apparent hand size is the noisiest measurement in dim light. It controls
+  // depth, palm scale, and therefore the scene lighting, so filter it before
+  // any of those values are derived.
+  const distanceFilters = [new OneEuro(.75, .006), new OneEuro(.75, .006)];
   let faceVertexScratch: Float32Array | undefined;
 
   function resize() {
@@ -481,13 +515,15 @@ export async function createHandTracker(
     const videoWidth = video.videoWidth || 1280;
     const videoHeight = video.videoHeight || 720;
     const drawnWidth = videoWidth * Math.max(width / videoWidth, height / videoHeight);
-    const handDistances = hands.map(hand => {
+    const handDistances = hands.map((hand, index) => {
       // Include relative landmark z: an edge-on palm must not appear to recede.
       const span = Math.hypot(hand[5].x - hand[17].x,
         (hand[5].y - hand[17].y) * videoHeight / videoWidth,
         (hand[5].z ?? 0) - (hand[17].z ?? 0));
-      return distanceMm(HAND_SPAN_MM, span * drawnWidth, drawnWidth);
+      const measured = distanceMm(HAND_SPAN_MM, span * drawnWidth, drawnWidth);
+      return distanceFilters[index].filter(measured, frameTime);
     });
+    for (let index = hands.length; index < distanceFilters.length; index += 1) distanceFilters[index].reset();
 
     // --- Rig first, so every gesture measure below reads the same filtered
     // geometry the renderer will mask and light with.
@@ -666,8 +702,8 @@ export async function createHandTracker(
       );
     }
 
-    smoothedConfinement += (targetConfinement - smoothedConfinement) * ease(.055);
-    smoothedFacing += (facing - smoothedFacing) * ease(.12);
+    smoothedConfinement += (targetConfinement - smoothedConfinement) * ease(.1);
+    smoothedFacing += (facing - smoothedFacing) * ease(.18);
     smoothedConfidence += (confidence - smoothedConfidence) * ease(.2);
 
     const labels: Record<FieldState, string> = {
@@ -701,7 +737,7 @@ export async function createHandTracker(
     if (transition.holdAnchors) [leftDepth, rightDepth] = heldDepths;
     else heldDepths = [leftDepth, rightDepth];
     const normalisedPlane = fieldDepthFromEndpoints({ x: 0, y: 0, z: leftDepth }, { x: 0, y: 0, z: rightDepth });
-    smoothedDepth += (normalisedPlane - smoothedDepth) * ease(.1);
+    smoothedDepth += (normalisedPlane - smoothedDepth) * ease(.2);
 
     // One hand, and it stays that hand. The block picks the more open palm when
     // it first acquires and then holds that slot for as long as the slot
@@ -796,7 +832,7 @@ export async function createHandTracker(
       const stamp = performance.now();
       const result = handLandmarker.detectForVideo(video, stamp);
       let face: Point[] | null = null;
-      if (faceLandmarker && quality.profile.faceMesh) {
+      if (!safeMode && faceLandmarker && quality.profile.faceMesh) {
         try {
           // Face geometry changes far slower than hands, so it is sampled at
           // half rate to keep two models inside the frame budget.
@@ -831,6 +867,24 @@ export async function createHandTracker(
     setGuide(enabled) {
       guideVisible = enabled;
       if (!enabled) guide.reset();
+    },
+    setSafeMode(enabled) {
+      if (!enabled || safeMode) return;
+      safeMode = true;
+      faceLandmarker?.close();
+      faceLandmarker = null;
+      faceTriangles = null;
+      lastFaceLandmarks = null;
+      segmenter?.destroy();
+      segmenter = null;
+      personMask = null;
+      depthEstimator?.destroy();
+      depthEstimator = null;
+      depthMap = null;
+      depthFit = null;
+    },
+    getDiagnostics() {
+      return { segmentation: Boolean(segmenter), depth: Boolean(depthEstimator), safeMode };
     },
     destroy() {
       destroyed = true;

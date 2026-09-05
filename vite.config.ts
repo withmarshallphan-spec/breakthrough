@@ -43,8 +43,12 @@ export default defineConfig(async () => {
 
   // Wrangler snapshots its log path while the Cloudflare plugin is imported.
   const { cloudflare } = await import('@cloudflare/vite-plugin');
+  const buildId = process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 7)
+    ?? process.env.GITHUB_SHA?.slice(0, 7)
+    ?? 'local';
 
   return {
+    define: { __BUILD_ID__: JSON.stringify(buildId) },
     css: { postcss: { plugins: [tailwindcss()] } },
     server: isCodexSeatbeltSandbox
       ? { watch: { useFsEvents: false, usePolling: true } }
