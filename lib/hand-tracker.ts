@@ -13,7 +13,7 @@ import {
   type RigPoint,
 } from './palm-geometry';
 import { buildFaceFrame, trianglesFromTesselation, type FaceFrame } from './face-geometry';
-import { createPersonSegmenter, type PersonMask, type PersonSegmenter } from './segmentation';
+import type { PersonMask } from './segmentation';
 import {
   applyFit,
   createDepthEstimator,
@@ -103,14 +103,13 @@ export type HandTracker = {
   setDebug: (enabled: boolean) => void;
   setGuide: (enabled: boolean) => void;
   setSafeMode: (enabled: boolean) => void;
-  getDiagnostics: () => { segmentation: boolean; depth: boolean; safeMode: boolean };
   destroy: () => void;
 };
 
 export type HandTrackerOptions = {
   /**
    * Keep the safe path to the one model it needs: hand landmarks. The optional
-   * face, segmentation, and neural-depth stages all feed advanced compositing
+   * face and neural-depth stages feed advanced compositing
    * and must not jeopardise the native camera fallback.
   */
   safeMode?: boolean;
@@ -274,28 +273,6 @@ export async function createHandTracker(
   let guideVisible = true;
   const guide = createGuideLine();
 
-  // Person segmentation is optional, and it loads without blocking: hands and
-  // the field start immediately, and the silhouette joins the compositor
-  // whenever the model arrives.
-  let segmenter: PersonSegmenter | null = null;
-  let personMask: PersonMask | null = null;
-  if (!safeMode && quality.profile.segmentation) {
-    void createPersonSegmenter(vision, quality.profile.multiclassSegmentation)
-      .then((created) => {
-        if (destroyed || safeMode) created?.destroy();
-        else if (created) segmenter = created;
-        else {
-          quality.disable('segmentation');
-          onAdvancedStageFailure?.();
-        }
-      })
-      .catch(() => {
-        segmenter = null;
-        quality.disable('segmentation');
-        onAdvancedStageFailure?.();
-      });
-  }
-
   // Dense depth is the last thing to arrive and the first thing to go. It only
   // ever fills surfaces the rig cannot reach.
   let depthEstimator: DepthEstimator | null = null;
@@ -322,11 +299,6 @@ export async function createHandTracker(
       depthEstimator.destroy();
       depthEstimator = null;
       depthMap = null;
-    }
-    if (!profile.segmentation && segmenter) {
-      segmenter.destroy();
-      segmenter = null;
-      personMask = null;
     }
   });
 
@@ -813,7 +785,7 @@ export async function createHandTracker(
       handScale: rig === previousRig && !hands.length ? previousScales : handScale,
       face,
       faceTriangles,
-      person: personMask,
+      person: null,
       depth: depthMap,
       // Without a head there is no measured distance for a body, so the
       // silhouette is parked behind the scene: it can still catch rim light,
@@ -847,8 +819,6 @@ export async function createHandTracker(
           face = null;
         }
       }
-      // The silhouette is sampled from the same frame the landmarks came from.
-      if (segmenter) personMask = segmenter.update(video, video.videoWidth, video.videoHeight, stamp) ?? personMask;
       depthEstimator?.submit(video, stamp);
       updateControl(result.landmarks as Point[][], face, width, height);
     }
@@ -875,16 +845,10 @@ export async function createHandTracker(
       faceLandmarker = null;
       faceTriangles = null;
       lastFaceLandmarks = null;
-      segmenter?.destroy();
-      segmenter = null;
-      personMask = null;
       depthEstimator?.destroy();
       depthEstimator = null;
       depthMap = null;
       depthFit = null;
-    },
-    getDiagnostics() {
-      return { segmentation: Boolean(segmenter), depth: Boolean(depthEstimator), safeMode };
     },
     destroy() {
       destroyed = true;
@@ -893,8 +857,6 @@ export async function createHandTracker(
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       handLandmarker.close();
       faceLandmarker?.close();
-      segmenter?.destroy();
-      segmenter = null;
       depthEstimator?.destroy();
       depthEstimator = null;
     },

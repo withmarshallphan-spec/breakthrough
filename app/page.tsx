@@ -1,8 +1,8 @@
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { BookOpen, Bug, Clapperboard, Eye, EyeOff, Maximize, Minimize, SwitchCamera, Video } from 'lucide-react';
-import type { WaveDiagnosticStage, WaveEngine } from '@/lib/wave-engine';
+import { BookOpen, Clapperboard, Eye, EyeOff, Maximize, Minimize, SwitchCamera, Video } from 'lucide-react';
+import type { WaveEngine } from '@/lib/wave-engine';
 import type { FieldState, HandTracker } from '@/lib/hand-tracker';
 import { createQualityController, type QualityProfile } from '@/lib/quality';
 import {
@@ -52,85 +52,9 @@ type CameraConstraints = MediaTrackConstraints & {
   whiteBalanceMode?: string;
 };
 
-// iPadOS identifies itself as macOS in desktop-mode Safari, so touch support
-// is part of the platform readout in the diagnostics panel.
-const APPLE_TABLET = typeof navigator !== 'undefined' && (
-  /iPad/.test(navigator.userAgent)
-  || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
-);
 // Native video is the source of truth on every device. The GPU-only camera
 // composite remains a diagnostic stage, never the default presentation path.
 const GPU_SAFE_MODE = false;
-
-declare const __BUILD_ID__: string;
-
-const DIAGNOSTIC_STAGES: Array<{ id: WaveDiagnosticStage; label: string }> = [
-  { id: 'raw', label: '1 Raw video' },
-  { id: 'transparent', label: '2 Transparent canvas' },
-  { id: 'tracking', label: '3 Hand overlay' },
-  { id: 'wave', label: '4 Wave' },
-  { id: 'segmentation', label: '5 Segmentation' },
-  { id: 'depth', label: '6 Depth / refraction' },
-  { id: 'composite', label: '7 Final composite' },
-];
-
-type RuntimeDiagnostics = Record<string, string>;
-
-async function waitForVideoFrame(video: HTMLVideoElement) {
-  if (video.videoWidth < 1 || video.readyState < 2) {
-    await new Promise<void>((resolve) => {
-      const finish = () => {
-        video.removeEventListener('loadeddata', finish);
-        video.removeEventListener('playing', finish);
-        window.clearTimeout(timeout);
-        resolve();
-      };
-      const timeout = window.setTimeout(finish, 900);
-      video.addEventListener('loadeddata', finish, { once: true });
-      video.addEventListener('playing', finish, { once: true });
-    });
-  }
-
-  if (video.videoWidth > 0 && video.readyState >= 2 && 'requestVideoFrameCallback' in video) {
-    await new Promise<void>((resolve) => {
-      const timeout = window.setTimeout(resolve, 350);
-      video.requestVideoFrameCallback(() => {
-        window.clearTimeout(timeout);
-        resolve();
-      });
-    });
-  }
-}
-
-function nativeVideoHasPixels(video: HTMLVideoElement) {
-  if (video.videoWidth < 1 || video.videoHeight < 1 || video.readyState < 2) return false;
-  const probe = document.createElement('canvas');
-  probe.width = 8;
-  probe.height = 8;
-  const context = probe.getContext('2d', { willReadFrequently: true });
-  if (!context) return false;
-  try {
-    context.drawImage(video, 0, 0, probe.width, probe.height);
-    const pixels = context.getImageData(0, 0, probe.width, probe.height).data;
-    let brightPixels = 0;
-    for (let index = 0; index < pixels.length; index += 4) {
-      if (Math.max(pixels[index], pixels[index + 1], pixels[index + 2]) > 10) brightPixels += 1;
-    }
-    return brightPixels >= 3;
-  } catch {
-    return false;
-  }
-}
-
-async function cameraPipelineIsHealthy(video: HTMLVideoElement, engine: WaveEngine | null) {
-  await waitForVideoFrame(video);
-  // Check the decoded HTML frame first, then the exact WebGL VideoTexture path.
-  // Safari can satisfy the first check while producing a black GPU texture.
-  return video.videoWidth > 0
-    && video.readyState >= 2
-    && nativeVideoHasPixels(video)
-    && (engine ? engine.hasCameraTexturePixels() : true);
-}
 
 async function stabiliseCamera(track: MediaStreamTrack) {
   const capabilities = track.getCapabilities?.() as CameraCapabilities | undefined;
@@ -197,42 +121,11 @@ export default function Home() {
   const [profile, setProfile] = useState<QualityProfile>(quality.profile);
   const [rendererAvailable, setRendererAvailable] = useState(true);
   const gpuSafeModeRef = useRef(GPU_SAFE_MODE);
-  const [gpuSafeMode, setGpuSafeMode] = useState(GPU_SAFE_MODE);
-  const diagnosticStageRef = useRef<WaveDiagnosticStage>('wave');
-  const [diagnosticStage, setDiagnosticStage] = useState<WaveDiagnosticStage>('wave');
-  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
-  const [diagnostics, setDiagnostics] = useState<RuntimeDiagnostics>({});
 
   function enableGpuSafeMode() {
     gpuSafeModeRef.current = true;
-    setGpuSafeMode(true);
-    // This is intentionally independent of renderer availability. A healthy
-    // WebGL canvas can still have an unusable camera texture on iOS.
     waveRef.current?.setCameraCompositing(false);
     handTrackerRef.current?.setSafeMode(true);
-  }
-
-  function setRenderStage(stage: WaveDiagnosticStage) {
-    diagnosticStageRef.current = stage;
-    setDiagnosticStage(stage);
-    // Sampling the video through Three is an opt-in diagnostic. The normal
-    // experience always leaves the browser's video layer visible underneath.
-    waveRef.current?.setCameraCompositing(stage === 'composite' && !gpuSafeModeRef.current);
-    waveRef.current?.setDiagnosticStage(stage);
-    handTrackerRef.current?.setGuide(!filmMode && DIAGNOSTIC_STAGES.findIndex(({ id }) => id === stage) >= 2);
-  }
-
-  function toggleGpuSafeMode() {
-    if (!gpuSafeModeRef.current) {
-      enableGpuSafeMode();
-      return;
-    }
-    gpuSafeModeRef.current = false;
-    setGpuSafeMode(false);
-    waveRef.current?.setCameraCompositing(false);
-    // Rebuild optional stages from the live user gesture. Safe mode tears them
-    // down intentionally, so turning it off needs a fresh tracker instance.
-    if (streamRef.current) void startCamera(activeCameraId || undefined);
   }
 
   useEffect(() => {
@@ -272,12 +165,7 @@ export default function Home() {
           (fps) => quality.observe(fps),
           { cameraCompositing: false },
         );
-        waveRef.current.setDiagnosticStage(diagnosticStageRef.current);
-        if (videoRef.current.srcObject && diagnosticStageRef.current === 'composite') {
-          void cameraPipelineIsHealthy(videoRef.current, waveRef.current).then((healthy) => {
-            if (mounted && !healthy) enableGpuSafeMode();
-          });
-        }
+        waveRef.current.setDiagnosticStage('wave');
       } catch {
         fallBackToVideo();
       }
@@ -287,8 +175,6 @@ export default function Home() {
       if (event.metaKey || event.ctrlKey || event.altKey) return;
       if (event.target instanceof HTMLSelectElement || event.target instanceof HTMLInputElement) return;
       const key = event.key.toLowerCase();
-      if (key === 'i') return toggleGpuSafeMode();
-      if (key === 'x') return setDiagnosticsOpen(current => !current);
       if (key === 'd') return handTrackerRef.current?.setDebug(event.shiftKey);
       if (key === 'escape') return setReaderOpen(false);
       if (key === 'n') return setReaderOpen(current => !current);
@@ -313,45 +199,11 @@ export default function Home() {
         setHands(0);
       }
     }, 250);
-    const diagnosticWatchdog = window.setInterval(() => {
-      const video = videoRef.current;
-      const track = streamRef.current?.getVideoTracks()[0];
-      const wave = waveRef.current?.getDiagnostics();
-      const tracker = handTrackerRef.current?.getDiagnostics();
-      const canvas = webglRef.current;
-      const settings = track?.getSettings();
-      const userAgent = navigator.userAgent;
-      const browser = /CriOS/.test(userAgent) ? 'Chrome iOS' : /FxiOS/.test(userAgent) ? 'Firefox iOS'
-        : /Safari/.test(userAgent) ? 'Safari' : /Chrome/.test(userAgent) ? 'Chrome' : 'Unknown';
-      setDiagnostics({
-        build: __BUILD_ID__,
-        platform: `${APPLE_TABLET ? 'Apple touch' : navigator.platform} / ${browser}`,
-        'video.readyState': String(video?.readyState ?? 0),
-        'video.videoWidth': String(video?.videoWidth ?? 0),
-        'video.videoHeight': String(video?.videoHeight ?? 0),
-        'video.paused': String(video?.paused ?? true),
-        'video.ended': String(video?.ended ?? false),
-        'track.readyState': track?.readyState ?? 'none',
-        'track.muted': String(track?.muted ?? false),
-        'camera resolution': settings?.width && settings.height ? `${settings.width} x ${settings.height}` : 'unknown',
-        dpr: String(window.devicePixelRatio),
-        'canvas CSS': canvas ? `${canvas.clientWidth} x ${canvas.clientHeight}` : 'none',
-        'canvas backing': canvas ? `${canvas.width} x ${canvas.height}` : 'none',
-        WebGL2: wave?.webgl2 ? 'yes' : 'no',
-        WebGPU: (navigator as Navigator & { gpu?: unknown }).gpu ? 'available' : 'no',
-        segmentation: tracker?.segmentation ? 'active' : 'off',
-        depth: tracker?.depth ? 'active' : 'off',
-        'webcam texture': wave?.cameraTextureInitialized ? 'initialized' : 'not initialized',
-        'render mode': wave?.cameraCompositing ? 'final composite' : 'native video + transparent overlay',
-        stage: wave?.diagnosticStage ?? diagnosticStageRef.current,
-      });
-    }, 400);
 
     return () => {
       mounted = false;
       stopWatching();
       window.clearInterval(watchdog);
-      window.clearInterval(diagnosticWatchdog);
       window.removeEventListener('keydown', onKey);
       document.removeEventListener('fullscreenchange', onFullscreen);
       canvas?.removeEventListener('webglcontextlost', onContextLost);
@@ -390,10 +242,6 @@ export default function Home() {
         await videoRef.current.play();
         handTrackerRef.current?.destroy();
         handTrackerRef.current = null;
-        if (diagnosticStageRef.current === 'composite') {
-          const pipelineHealthy = await cameraPipelineIsHealthy(videoRef.current, waveRef.current);
-          if (!pipelineHealthy) enableGpuSafeMode();
-        }
       }
 
       previousStream?.getTracks().forEach((track) => track.stop());
@@ -439,7 +287,7 @@ export default function Home() {
           onAdvancedStageFailure: enableGpuSafeMode,
         });
         tracker.setDebug(false);
-        tracker.setGuide(!filmMode && DIAGNOSTIC_STAGES.findIndex(({ id }) => id === diagnosticStageRef.current) >= 2);
+        tracker.setGuide(!filmMode);
         handTrackerRef.current = tracker;
       }
     } catch {
@@ -497,7 +345,6 @@ export default function Home() {
       ref={stageRef}
       className={`stage ${filmMode ? 'film-mode' : ''} ${interfaceHidden ? 'interface-hidden' : ''}`}
       data-renderer={rendererAvailable ? 'webgl' : 'video'}
-      data-diagnostic-stage={diagnosticStage}
       aria-label="Quantum confinement instrument"
     >
       <video ref={videoRef} className="camera-feed" autoPlay muted playsInline />
@@ -606,9 +453,6 @@ export default function Home() {
       )}
 
       <nav className="tools" aria-label="Capture controls">
-        <button type="button" onClick={() => setDiagnosticsOpen(current => !current)} data-active={diagnosticsOpen} aria-label="Diagnostics" title="Diagnostics · X">
-          <Bug {...ICON} />
-        </button>
         {cameraState === 'live' && cameraDevices.length > 1 && (
           <label className="camera-picker" title="Camera source">
             <SwitchCamera {...ICON} aria-hidden="true" />
@@ -639,24 +483,6 @@ export default function Home() {
           {fullscreen ? <Minimize {...ICON} /> : <Maximize {...ICON} />}
         </button>
       </nav>
-      {diagnosticsOpen && (
-        <aside className="diagnostics" aria-label="Camera pipeline diagnostics">
-          <header>
-            <p className="meta">camera diagnostics</p>
-            <button type="button" onClick={toggleGpuSafeMode} data-active={gpuSafeMode}>I GPU safe mode</button>
-          </header>
-          <div className="diagnostic-stages" role="group" aria-label="Render stages">
-            {DIAGNOSTIC_STAGES.map(({ id, label }) => (
-              <button key={id} type="button" onClick={() => setRenderStage(id)} data-active={diagnosticStage === id}>{label}</button>
-            ))}
-          </div>
-          <dl>
-            {Object.entries(diagnostics).map(([label, value]) => (
-              <div key={label}><dt>{label}</dt><dd>{value}</dd></div>
-            ))}
-          </dl>
-        </aside>
-      )}
     </main>
   );
 }
