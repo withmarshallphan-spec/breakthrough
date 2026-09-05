@@ -70,6 +70,7 @@ button { font: inherit; color: inherit; }
 
 .camera-feed { z-index: 0; object-fit: cover; transform: scaleX(-1); }
 .wave-canvas { z-index: 2; pointer-events: none; background: transparent; }
+.stage[data-ios-safe-mode='true'] .wave-canvas { mix-blend-mode: screen; }
 .tracking-canvas { z-index: 3; pointer-events: none; }
 /* A live camera is more useful than a black canvas when a device cannot keep
    the WebGL compositor alive. The tracking guide remains available above it. */

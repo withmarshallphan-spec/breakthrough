@@ -56,12 +56,13 @@ type CameraConstraints = MediaTrackConstraints & {
 // is part of the test. This is deliberately a runtime toggle, not a build-time
 // branch: a camera-texture failure on any device can promote it to safe mode.
 const APPLE_TABLET = typeof navigator !== 'undefined' && (
-  /iPad|iPhone|iPod/.test(navigator.userAgent)
+  /iPad/.test(navigator.userAgent)
   || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
 );
-// Set by the manual diagnostic control or a failed runtime health check. Keep
-// this false by default so the ladder can reproduce and isolate an iPad issue.
-const IOS_SAFE_MODE = false;
+// The stage ladder established that iPad's final camera-texture compositor is
+// the failing boundary. Start there in native-video overlay mode; the final
+// composite remains available in diagnostics for future device testing.
+const IOS_SAFE_MODE = APPLE_TABLET;
 
 declare const __BUILD_ID__: string;
 

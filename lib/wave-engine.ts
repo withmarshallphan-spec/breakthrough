@@ -667,8 +667,12 @@ const compositeFragmentShader = /* glsl */ `
     if (uCameraCompositing < .5) {
       vec3 emission = texture2D(tEmissive, vUv).rgb;
       vec3 halo = texture2D(tLight, vUv).rgb;
-      vec3 overlay = emission + halo * .46;
-      float alpha = clamp(max(max(overlay.r, overlay.g), overlay.b) * .72, 0.0, .92);
+      // In native-video mode this is the whole light treatment: bring the
+      // field's broad irradiance back into the transparent layer so palms and
+      // the surrounding space still bloom without sampling the camera texture.
+      vec3 overlay = emission * 1.45 + halo * 5.2;
+      overlay = vec3(1.0) - exp(-overlay * 1.35);
+      float alpha = clamp(max(max(overlay.r, overlay.g), overlay.b) * .88, 0.0, .96);
       gl_FragColor = vec4(overlay, alpha);
       return;
     }
