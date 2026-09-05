@@ -33,7 +33,9 @@ test('opening a clasp fires one decaying release impulse', () => {
   const machine = createFieldStateMachine();
   assert.equal(machine.update(sample(0, 2, 6, 0)).pulse, 0);
   assert.equal(machine.update(sample(100, 2, 1)).pulse, 0, 'entering a clasp is not the event');
-  const opened = machine.update(sample(116, 2, 1.7));
+  // Above the widened exit threshold: a clasp is sticky until the palms are
+  // clearly apart again.
+  const opened = machine.update(sample(116, 2, 2.4));
   assert.ok(opened.pulse > .9 && opened.pulse <= 1, `release fires, got ${opened.pulse}`);
   // Stepped at a real frame interval, because the impulse decays per frame.
   let last = opened.pulse;
@@ -58,8 +60,18 @@ test('brief total loss holds a clasp then becomes dormant', () => {
 test('opening after a clasp consistently enters release even without opening velocity', () => {
   const machine = createFieldStateMachine();
   machine.update(sample(100, 2, 1));
-  assert.equal(machine.update(sample(200, 2, 1.6)).state, 'release');
-  assert.equal(machine.update(sample(300, 2, 1.7)).state, 'release');
+  assert.equal(machine.update(sample(200, 2, 2.1)).state, 'release');
+  assert.equal(machine.update(sample(300, 2, 2.4)).state, 'release');
+});
+
+test('the clasp gate is easier to reach than it is to leave', () => {
+  const machine = createFieldStateMachine();
+  machine.update(sample(0, 2, 6, 0));
+  // Entering: palms about one and a half palm-widths apart already read closed.
+  assert.equal(machine.update(sample(100, 2, 1.4)).state, 'clasped');
+  // Leaving: the same distance holds, and a good deal more besides.
+  assert.equal(machine.update(sample(200, 2, 1.8)).state, 'clasped');
+  assert.equal(machine.update(sample(300, 2, 2.2)).state, 'release');
 });
 
 test('palm boundary follows wrist and MCPs under rotation and translation', () => {

@@ -4,8 +4,10 @@ import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import type { TrackingUpdate } from './hand-tracker';
-import { PALM_CONTOUR_POINTS, type PalmFrame } from './palm-geometry';
+import { insetContour, NEARNESS_SPAN_MM, PALM_CONTOUR_POINTS, type PalmFrame, type RigPoint } from './palm-geometry';
 import { MODES, normalisedEnergy, relativeWellWidth } from './quantum';
+import type { QualityProfile } from './quality';
+import { emissionFor, PHASE_CHROMA } from './field-palette';
 
 export type FieldPoint = { x: number; y: number };
 
@@ -13,6 +15,8 @@ export type FieldTracking = TrackingUpdate;
 
 export type WaveEngine = {
   setTracking: (tracking: FieldTracking) => void;
+  /** Follow a tier change without rebuilding the pipeline. */
+  setProfile: (profile: QualityProfile) => void;
   destroy: () => void;
 };
 
@@ -36,13 +40,34 @@ const waveChunk = /* glsl */ `
   uniform float uWeights[MODES];
   uniform float uPhases[MODES];
 
-  float psi(float t, float lag) {
-    float sum = 0.0;
+  /**
+   * The superposition as a complex amplitude. Each mode contributes its own
+   * spatial shape times its own rotating phase factor; the real part is what
+   * the ribbon traces, and the argument is the phase.
+   */
+  vec2 psiComplex(float t, float lag) {
+    vec2 sum = vec2(0.0);
     for (int i = 0; i < MODES; i++) {
       float n = float(i + 1);
-      sum += sqrt(uWeights[i]) * sin(n * PI * t) * cos(uPhases[i] + lag * n);
+      float amplitude = sqrt(uWeights[i]) * sin(n * PI * t);
+      float angle = uPhases[i] + lag * n;
+      sum += amplitude * vec2(cos(angle), sin(angle));
     }
     return sum;
+  }
+
+  float psi(float t, float lag) { return psiComplex(t, lag).x; }
+
+  /**
+   * arg(psi). Probability density throws the phase away; it is nevertheless a
+   * real property of the state, and the one that makes a wavefunction a wave
+   * rather than a cloud. Showing it in hue while density stays in brightness is
+   * the standard domain-colouring convention, and it means the colour on screen
+   * is carrying information instead of decorating.
+   */
+  float psiPhase(float t, float lag) {
+    vec2 z = psiComplex(t, lag);
+    return atan(z.y, z.x);
   }
 
   float dpsi(float t, float lag) {
@@ -74,13 +99,35 @@ const waveChunk = /* glsl */ `
 // which is kinder to skin tones through the green middle of the range.
 
 
-// False color conveys increasing confinement. It is not a photon wavelength.
-// Cores stay near white; only the flanks take color.
+// The source's own colour, set per state on the CPU: ice-blue when the state
+// is broad, silver through white as it is confined, a faint warm cast only in
+// the falloff at high confinement. It is a chosen palette, not predicted
+// emission -- and the core stays neutral, which is how a genuinely bright
+// source lands on skin. Nothing here tints a whole hand.
 const paletteChunk = /* glsl */ `
   uniform vec3 uEmission;
-  const vec3 SILVER = vec3(1.0, .92, .86);
+  uniform float uPhaseChroma;
+  const vec3 SILVER = vec3(1.0, .985, .965);
 
   vec3 fieldTint(float energy) { return uEmission; }
+
+  /**
+   * Hue from the phase of the state, over the whole hue circle -- domain
+   * colouring proper, so arg(psi) maps one-to-one onto hue and no two phases
+   * share a colour.
+   *
+   * Normalised to fixed luminance, which is the load-bearing step: a raw hue
+   * wheel swings by a factor of two in brightness between yellow and blue, and
+   * brightness here is already carrying |psi|^2. Left unnormalised the colour
+   * would be restating the density, and restating it wrongly.
+   *
+   * Mirrored in lib/field-palette.ts, where these properties are tested.
+   */
+  vec3 phaseTint(float phase) {
+    vec3 wheel = .5 + .5 * cos(phase + vec3(0.0, 2.0943951, 4.1887902));
+    wheel = mix(vec3(1.0), wheel, uPhaseChroma);
+    return wheel / max(dot(wheel, vec3(.299, .587, .114)), 1e-4);
+  }
 `;
 
 const frameChunk = /* glsl */ `
@@ -90,6 +137,13 @@ const frameChunk = /* glsl */ `
   uniform float uConfinement;
   uniform float uMode;
   uniform float uPulse;
+  /**
+   * How near the state is to collapse: palms very close, nothing sealed yet.
+   * Rises continuously out of the confinement dial and falls away again as a
+   * clasp takes over, so the treatment ramps in rather than switching on.
+   * Everything it drives narrows or brightens -- nothing it drives shakes.
+   */
+  uniform float uCritical;
 
   float aspectOf() { return uResolution.x / max(uResolution.y, 1.0); }
   vec2 toSquare(vec2 ndc, float aspect) { return vec2(ndc.x * aspect, ndc.y); }
@@ -98,7 +152,8 @@ const frameChunk = /* glsl */ `
   // The release impulse breathes the whole volume outward for a moment, so
   // opening a clasp is an event rather than a fade back to the resting size.
   float amplitudeFor(float span) {
-    return max(span * mix(.24, .19, uConfinement) * (1.0 + uPulse * .24), .008);
+    return max(span * mix(.24, .19, uConfinement)
+      * (1.0 - uCritical * .34) * (1.0 + uPulse * .24), .008);
   }
 `;
 
@@ -129,14 +184,47 @@ const volumeChunk = /* glsl */ `
   }
 `;
 
+// How much the mask edge is broken up. The occluder is rendered at a fraction
+// of display resolution, so its boundary arrives as a visible staircase; a fine
+// dot screen dissolves that into a halftone the eye reads as a soft edge
+// instead of a cut. It only acts inside the transition band -- solid fingers
+// stay solid and clear sky stays clear.
+const HALFTONE_DEPTH = .55;
+
+// Shared by the passes that cut the field and by the composite that shades its
+// edges, so both agree about where a silhouette ends. Kept separate from the
+// occluder chunk because the composite declares its own samplers and cannot
+// take that one wholesale.
+const halftoneChunk = /* glsl */ `
+  /** A rotated dot screen, in device pixels. */
+  float halftone(vec2 fragment) {
+    vec2 rotated = vec2(fragment.x * .7071 - fragment.y * .7071,
+                        fragment.x * .7071 + fragment.y * .7071);
+    return sin(rotated.x * 1.05) * sin(rotated.y * 1.05) * .5 + .5;
+  }
+
+  /** Dither only the soft shoulder of a coverage value. */
+  float featherCoverage(float coverage, vec2 fragment) {
+    float shoulder = 1.0 - abs(coverage * 2.0 - 1.0);
+    return clamp(coverage + (halftone(fragment) - .5) * shoulder * ${HALFTONE_DEPTH.toFixed(2)}, 0.0, 1.0);
+  }
+`;
+
 const occlusionChunk = /* glsl */ `
   uniform sampler2D tOccluder;
   uniform vec2 uRenderResolution;
   uniform float uOcclusion;
+
+  ${halftoneChunk}
+
   float visibilityAt(vec2 uv, float depth) {
     vec4 hand = texture2D(tOccluder, uv);
-    // A narrow soft depth margin keeps fingers opaque without a hard cutout.
-    return 1.0 - uOcclusion * hand.a * smoothstep(depth - .006, depth + .022, hand.r);
+    // A wider soft depth margin than a hard cutout, then the dot screen across
+    // the edge itself, so a finger crossing a strand dissolves it rather than
+    // slicing it.
+    float ahead = smoothstep(depth - .012, depth + .05, hand.r);
+    float covered = featherCoverage(hand.a * ahead, uv * uRenderResolution);
+    return 1.0 - uOcclusion * covered;
   }
 `;
 
@@ -215,18 +303,26 @@ const personVertexShader = /* glsl */ `
     vUv = uv;
     // Same clip-space depth convention as the rig spheres under the shared
     // orthographic camera: world z = 2 * nearness - 1, clip z = -world z / 2.
+    // The plane sits at the head's distance so the rig always wins the depth
+    // test; the per-pixel distance it reports in r is the useful part.
     gl_Position = vec4(position.xy, .5 - uBodyDepth, 1.0);
   }
 `;
 // How hard the silhouette edge rolls the normal over. This is the only shape
 // a mask can carry; it exists so a body catches rim light, not to fake relief.
 const PERSON_RELIEF = 2.6;
+// How hard a depth-map slope rolls the normal over, once dense depth is
+// available and the body has real relief rather than only an outline.
+const DEPTH_RELIEF = 9.0;
 const personFragmentShader = /* glsl */ `
   precision highp float;
   uniform sampler2D tPerson;
+  uniform sampler2D tDepth;
   uniform vec2 uResolution;
   uniform vec2 uVideoSize;
   uniform vec2 uPersonTexel;
+  uniform vec2 uDepthTexel;
+  uniform float uHasDepth;
   uniform float uBodyDepth;
   varying vec2 vUv;
 
@@ -240,6 +336,7 @@ const personFragmentShader = /* glsl */ `
   }
 
   float personAt(vec2 uv) { return texture2D(tPerson, coverUv(uv)).r; }
+  float depthAt(vec2 uv) { return texture2D(tDepth, coverUv(uv)).r; }
 
   void main() {
     float coverage = personAt(vUv);
@@ -247,12 +344,34 @@ const personFragmentShader = /* glsl */ `
     // Sampled in screen space, so the mirrored feed is handled by coverUv and
     // the gradient still points the way it looks like it should.
     vec2 probe = uPersonTexel * 2.0;
-    vec2 gradient = vec2(
+    vec2 outline = vec2(
       personAt(vUv + vec2(probe.x, 0.0)) - personAt(vUv - vec2(probe.x, 0.0)),
       personAt(vUv + vec2(0.0, probe.y)) - personAt(vUv - vec2(0.0, probe.y)));
-    float slope = clamp(length(gradient) * ${PERSON_RELIEF.toFixed(1)}, 0.0, .94);
-    vec2 normalXy = -gradient / max(length(gradient), 1e-5) * slope;
-    gl_FragColor = vec4(uBodyDepth, normalXy * .5 + .5, coverage);
+    float outlineSlope = clamp(length(outline) * ${PERSON_RELIEF.toFixed(1)}, 0.0, .94);
+    vec2 maskNormal = -outline / max(length(outline), 1e-5) * outlineSlope;
+
+    // With dense depth the body has actual relief, so the normal comes from
+    // the depth gradient -- a shoulder turns away from the light because it is
+    // turned away, not because it is near the edge of a cut-out.
+    float depth = uBodyDepth;
+    vec2 normalXy = maskNormal;
+    if (uHasDepth > .5) {
+      vec2 step = uDepthTexel * 1.5;
+      float left = depthAt(vUv - vec2(step.x, 0.0));
+      float right = depthAt(vUv + vec2(step.x, 0.0));
+      float down = depthAt(vUv - vec2(0.0, step.y));
+      float up = depthAt(vUv + vec2(0.0, step.y));
+      depth = depthAt(vUv);
+      // A height field with z toward the viewer has normal proportional to
+      // (-df/dx, -df/dy, 1); the gain folds in the sample spacing.
+      vec2 slope = vec2(right - left, up - down) * ${DEPTH_RELIEF.toFixed(1)};
+      float magnitude = length(slope);
+      normalXy = -slope / max(magnitude, 1e-5) * clamp(magnitude, 0.0, .94);
+      // Keep the silhouette's own edge roll where the depth map is smoothest:
+      // it is what makes a body catch rim light from behind.
+      normalXy = mix(normalXy, maskNormal, clamp(outlineSlope - magnitude, 0.0, 1.0));
+    }
+    gl_FragColor = vec4(clamp(depth, 0.0, 1.0), normalXy * .5 + .5, coverage);
   }
 `;
 
@@ -343,8 +462,8 @@ const emissiveFragmentShader = /* glsl */ `
 
     float bridge = 1.0 - smoothstep(0.0, .7, uSeal);
     float box = smoothstep(-.008, .008, t) * smoothstep(-.008, .008, 1.0 - t) * bridge;
-    float coreWidth = span * .009 + .004;
-    float glowWidth = span * .07 + .018;
+    float coreWidth = (span * .009 + .004) * (1.0 - uCritical * .38);
+    float glowWidth = (span * .07 + .018) * (1.0 - uCritical * .3);
     float core = exp(-(dist * dist) / (coreWidth * coreWidth));
     float glow = exp(-(dist * dist) / (glowWidth * glowWidth));
 
@@ -359,7 +478,9 @@ const emissiveFragmentShader = /* glsl */ `
 
     vec2 knotOffset = q - middle;
     float knotDist = length(knotOffset);
-    float knotRadius = max(uPalmScale * .48, .018);
+    // Sealing compresses the volume rather than just dimming the bridge: the
+    // interior tightens as the hands close on it.
+    float knotRadius = max(uPalmScale * .48 * (1.0 - uSeal * .34), .012);
     vec2 smokeUv = knotOffset / knotRadius;
     float turbulence = mist(smokeUv * 2.3 + vec2(-uTime * .17, uTime * .23));
     knotRadius *= .78 + .44 * turbulence;
@@ -369,21 +490,30 @@ const emissiveFragmentShader = /* glsl */ `
     float sealed = uSeal * uPresence;
 
     vec3 tint = fieldTint(uEnergy);
-    vec3 halo = mix(tint, SILVER, .3);
+    // The body of the wave takes the phase where it is; the halo and the core
+    // stay near neutral, because that is the part that becomes room light and
+    // a saturated spill on skin reads as a filter over the shot.
+    vec3 body = phaseTint(psiPhase(clamp(t, 0.0, 1.0), 0.0));
+    vec3 halo = mix(tint, SILVER, .12);
 
     vec3 color = vec3(0.0);
-    color += SILVER * core * box * (.07 + uEnergy * .1) * uPresence;
-    color += halo * glow * box * (.075 + uEnergy * .15) * uPresence;
-    color += tint * cloud * box * (.018 + uEnergy * .035) * uPresence;
-    color += tint * haze * box * (.008 + uEnergy * .015) * uPresence;
-    color += SILVER * knotCore * sealed * (.14 + uEnergy * .2);
-    color += tint * knot * churn * sealed * (.07 + uEnergy * .15);
+    color += SILVER * core * box * (.06 + uEnergy * .09) * uPresence;
+    color += halo * glow * box * (.05 + uEnergy * .1) * uPresence;
+    color += body * cloud * box * (.055 + uEnergy * .11) * uPresence;
+    color += body * haze * box * (.03 + uEnergy * .055) * uPresence;
+    // A sealed interior is brighter and smaller than the open bridge it
+    // replaces, which is what makes a clasp read as compression rather than as
+    // the effect having been switched off. It is only ever seen through the
+    // hands or through the gaps between the fingers -- the visibility test
+    // below is what puts it behind them.
+    color += SILVER * knotCore * sealed * (.19 + uEnergy * .28) * (1.0 + uSeal * .5);
+    color += tint * knot * churn * sealed * (.08 + uEnergy * .17);
 
     float wisps = mist(vec2(t * 6.0 - uTime * .14, d / max(amp, .01) * 2.2 + uTime * .1));
-    color += tint * haze * box * smoothstep(.34, .73, wisps) * (.025 + uEnergy * .08) * uPresence;
+    color += body * haze * box * smoothstep(.34, .73, wisps) * (.04 + uEnergy * .1) * uPresence;
     // Squeezing produces a hotter core and denser surrounding light, rather
     // than just reducing the total number of lit pixels.
-    float radiance = 1.0 + uEnergy * 1.9 + uSeal * 1.1;
+    float radiance = 1.0 + uEnergy * 1.9 + uSeal * 1.1 + uCritical * 1.5;
     color *= radiance;
     float fieldDepth = nearAt(fieldPoint(clamp(t, 0.0, 1.0), d, -uSeal * uPalmScale * .18));
     color *= visibilityAt(vUv, fieldDepth);
@@ -419,8 +549,14 @@ const compositeFragmentShader = /* glsl */ `
   uniform sampler2D tEmissive;
   uniform sampler2D tLight;
   uniform sampler2D tOccluder;
-  uniform sampler2D tHandOccluder;
+  uniform sampler2D tFrontOccluder;
   uniform sampler2D tPalm;
+  uniform sampler2D tPerson;
+  uniform sampler2D tDepth;
+  uniform vec2 uVideoSize;
+  uniform vec2 uRenderResolution;
+  uniform float uHasDepth;
+  uniform float uHasSkin;
   uniform float uTime;
   uniform vec2 uTexel;
   uniform vec2 uOccluderTexel;
@@ -447,17 +583,39 @@ const compositeFragmentShader = /* glsl */ `
   const float SEAL_TRANSMIT = 20.0;
   // Over how much of the depth range the light falls to a quarter strength.
   // Depth is 0..1 nearness, derived from apparent size, so this is a real
-  // distance falloff between the hands and the face behind them.
-  const float DEPTH_RANGE = .22;
+  // distance falloff between the hands and the face behind them. Generous on
+  // purpose: a face is most of a metre behind the hands holding the field, and
+  // a tight falloff leaves it unlit however bright the source is.
+  const float DEPTH_RANGE = .38;
   // What is assumed for pixels the rig knows nothing about -- the room behind.
   const float BACKGROUND_DEPTH = .08;
+  // How far the field throws light as a source in the room, in camera units.
+  // The whole tracked depth range is about .84 units deep, so a radius well
+  // past that lights the whole subject and the wall behind them, not just the
+  // hands holding it.
+  const float NEAR_FIELD_RADIUS = 2.1;
+  // How hard that near-field term lights the room, relative to the screen-space
+  // irradiance it sits alongside.
+  const float MATCH_GAIN = 1.6;
 
   ${waveChunk}
   ${frameChunk}
   ${paletteChunk}
   ${volumeChunk}
+  ${halftoneChunk}
 
   float luma(vec3 c) { return dot(c, vec3(.299, .587, .114)); }
+
+  // Same cover-and-mirror mapping the camera pass uses, so the silhouette and
+  // the depth map line up with the image they were computed from.
+  vec2 coverUv(vec2 uv) {
+    float screenAspect = uResolution.x / max(uResolution.y, 1.0);
+    float videoAspect = uVideoSize.x / max(uVideoSize.y, 1.0);
+    if (screenAspect > videoAspect) uv.y = (uv.y - .5) * (videoAspect / screenAspect) + .5;
+    else uv.x = (uv.x - .5) * (screenAspect / videoAspect) + .5;
+    uv.x = 1.0 - uv.x;
+    return uv;
+  }
 
   void main() {
     float aspect = aspectOf();
@@ -477,20 +635,22 @@ const compositeFragmentShader = /* glsl */ `
     vec4 mask = texture2D(tOccluder, vUv);
     float coverage = mask.a * uHasOccluder;
     float localDepth = nearAt(fieldPoint(clamp(t, 0.0, 1.0), d, -uSeal * uPalmScale * .18));
-    vec4 handMask = texture2D(tHandOccluder, vUv);
-    float handCoverage = handMask.a;
-    float inFront = smoothstep(localDepth - .006, localDepth + .022, handMask.r);
-    float hidden = clamp(handCoverage * inFront, 0.0, 1.0);
+    vec4 frontMask = texture2D(tFrontOccluder, vUv);
+    float frontCoverage = frontMask.a;
+    // The same widened band and dot screen the field itself is cut with, so the
+    // refraction and the strand agree about where an edge is.
+    float inFront = smoothstep(localDepth - .012, localDepth + .05, frontMask.r);
+    float hidden = featherCoverage(clamp(frontCoverage * inFront, 0.0, 1.0), vUv * uRenderResolution);
     float visible = 1.0 - hidden;
 
-    float mL = texture2D(tHandOccluder, vUv - vec2(uOccluderTexel.x, 0.0)).a;
-    float mR = texture2D(tHandOccluder, vUv + vec2(uOccluderTexel.x, 0.0)).a;
-    float mD = texture2D(tHandOccluder, vUv - vec2(0.0, uOccluderTexel.y)).a;
-    float mU = texture2D(tHandOccluder, vUv + vec2(0.0, uOccluderTexel.y)).a;
+    float mL = texture2D(tFrontOccluder, vUv - vec2(uOccluderTexel.x, 0.0)).a;
+    float mR = texture2D(tFrontOccluder, vUv + vec2(uOccluderTexel.x, 0.0)).a;
+    float mD = texture2D(tFrontOccluder, vUv - vec2(0.0, uOccluderTexel.y)).a;
+    float mU = texture2D(tFrontOccluder, vUv + vec2(0.0, uOccluderTexel.y)).a;
     float rimEdge = length(vec2(mR - mL, mU - mD)) * uHasOccluder;
 
     // --- Refraction -------------------------------------------------------
-    float glowWidth = span * .07 + .018;
+    float glowWidth = (span * .07 + .018) * (1.0 - uCritical * .3);
     float slope = dpsi(t, 0.0) * amp / span;
     float dist = abs(d - y) * inversesqrt(1.0 + slope * slope);
     float wellGate = step(0.0, t) * step(t, 1.0);
@@ -498,7 +658,7 @@ const compositeFragmentShader = /* glsl */ `
     vec2 knotOffset = q - (left + right) * .5;
     float claspLens = exp(-dot(knotOffset, knotOffset) / max(uPalmScale * uPalmScale * .8, .0001)) * uSeal * uPresence * visible;
     vec2 nUv = vec2(nrm.x / aspect, nrm.y) * .5;
-    float strength = (.012 + uEnergy * .026) * lens;
+    float strength = (.012 + uEnergy * .026 + uCritical * .022) * lens;
     vec2 offset = nUv * clamp((d - y) / max(glowWidth, .001), -1.5, 1.5) * strength;
     offset += knotOffset * sin(length(knotOffset) * 65.0 - uTime * 2.0) * claspLens * .007;
     float dispersion = strength * .18;
@@ -552,7 +712,11 @@ const compositeFragmentShader = /* glsl */ `
     // rig covers also has a depth, so the falloff between the field's plane and
     // the surface it lands on is a real one: a face further back is dimmer, and
     // dims further as you lean away.
-    float surfaceDepth = mix(BACKGROUND_DEPTH, mask.r, coverage);
+    // Where the rig covers nothing, the dense depth map knows the distance of
+    // the room; without it, one flat assumption stands in for everything.
+    vec2 frameUv = coverUv(vUv);
+    float roomDepth = mix(BACKGROUND_DEPTH, texture2D(tDepth, frameUv).r, uHasDepth);
+    float surfaceDepth = mix(roomDepth, mask.r, coverage);
     float depthGap = surfaceDepth - localDepth;
     float depthFalloff = 1.0 / (1.0 + (depthGap * depthGap) / (DEPTH_RANGE * DEPTH_RANGE));
 
@@ -562,7 +726,7 @@ const compositeFragmentShader = /* glsl */ `
     vec4 palm = texture2D(tPalm, vUv);
     // The smooth body of the palm surface, not its structure: relighting skin
     // with the animated ridges would make the light itself flicker.
-    float palmLight = palm.b * handCoverage * (1.0 - smoothstep(palm.r + .025, palm.r + .07, handMask.r));
+    float palmLight = palm.b * frontCoverage * (1.0 - smoothstep(palm.r + .025, palm.r + .07, frontMask.r));
     palmLight *= (1.0 + uSeal * .3);
     float gL = luma(texture2D(tLight, vUv - vec2(uLightTexel.x, 0.0)).rgb);
     float gR = luma(texture2D(tLight, vUv + vec2(uLightTexel.x, 0.0)).rgb);
@@ -582,10 +746,31 @@ const compositeFragmentShader = /* glsl */ `
     vec3 halfVec = normalize(toLight + vec3(0.0, 0.0, 1.0));
     float specular = pow(max(dot(normal, halfVec), 0.0), 12.0) * .07;
 
+    // --- The field as a source standing in the room ----------------------
+    // The blurred buffer above only knows where light is *on screen*, so a face
+    // beside the field receives almost nothing from it however bright it is.
+    // This term treats the field as what it is: a small bright thing at a known
+    // place in the room. Every surface with a depth gets light from it by
+    // distance and orientation, which is how a struck match lights a room --
+    // not only the part of the wall it happens to overlap.
+    vec3 surfacePoint = unprojectPalm(vUv * 2.0 - 1.0, surfaceDepth);
+    vec3 sourcePoint = fieldPoint(.5, 0.0, -uSeal * uPalmScale * .18);
+    vec3 toSource = sourcePoint - surfacePoint;
+    float sourceDistance = max(length(toSource), .05);
+    vec3 sourceDir = toSource / sourceDistance;
+    // The same wrap the diffuse term uses: a broad near-field source does not
+    // leave a hard terminator.
+    float sourceLambert = clamp((dot(normal, sourceDir) + .35) / 1.35, 0.0, 1.0);
+    float sourceFalloff = 1.0 /
+      (1.0 + sourceDistance * sourceDistance / (NEAR_FIELD_RADIUS * NEAR_FIELD_RADIUS));
+    float matchLight = sourceLambert * sourceFalloff * uPresence
+      * (.4 + uEnergy * 1.2 + uSeal * .35 + uCritical * .75);
+
     // A brighter wave throws more light, not just a brighter wave.
-    float emissionGain = LIGHT_GAIN * (.65 + uEnergy * 1.0);
+    float emissionGain = LIGHT_GAIN * (.65 + uEnergy * 1.0 + uCritical * .6);
     vec3 tint = fieldTint(uEnergy);
     vec3 lit = irradiance * emissionGain * depthFalloff * (diffuse + specular);
+    lit += tint * matchLight * MATCH_GAIN;
     // Palms get their own contribution, still shaded and still attenuated by
     // distance, so it reads as light landing on skin rather than a decal.
     lit += tint * palmLight * depthFalloff * diffuse * (.09 + uEnergy * .18) * uPresence;
@@ -595,7 +780,15 @@ const compositeFragmentShader = /* glsl */ `
     vec3 emissive = texture2D(tEmissive, vUv).rgb;
     // A diffuse, additive scattering lobe lets red light lift dark skin and
     // fabric while preserving the original texture beneath it.
-    vec3 scattering = irradiance * depthFalloff * coverage * (1.3 + uEnergy * 2.6);
+    // Skin scatters this light; hair and clothing largely do not. With the
+    // multiclass silhouette the difference is known, so the diffuse lobe is
+    // held back off fabric instead of washing the whole subject evenly.
+    float skin = texture2D(tPerson, frameUv).g;
+    float material = mix(1.0, .45 + .8 * skin, uHasSkin);
+    vec3 scattering = irradiance * depthFalloff * coverage * material * (1.3 + uEnergy * 2.6);
+    // Skin is not opaque; a near source bleeds a little through it wherever it
+    // lands, which is what keeps the match light off the surface of a mask.
+    scattering += tint * matchLight * material * coverage * .22;
     vec3 color = albedo * (uAmbient + lit) + scattering;
     color += emissive;
 
@@ -607,7 +800,7 @@ const compositeFragmentShader = /* glsl */ `
     float grazing = pow(1.0 - abs(normal.z), 2.4);
     vec2 outward = normalize(rigNxy + vec2(1e-5)) * uLightTexel * 4.0;
     vec3 behindLight = texture2D(tLight, clamp(vUv + outward, .002, .998)).rgb;
-    float wrap = handCoverage * inFront * grazing * luma(behindLight) * RIM_GAIN * depthFalloff;
+    float wrap = frontCoverage * inFront * grazing * luma(behindLight) * RIM_GAIN * depthFalloff;
     // A thin specular catch right on the edge keeps it from reading as a decal.
     // Sealed, the same edges are where light escapes between the fingers, so
     // the catch is where a clasp shows its gaps.
@@ -622,8 +815,8 @@ const compositeFragmentShader = /* glsl */ `
     // here is gated on visibility: the whole point is light reaching skin that
     // is in front of the knot.
     float held = exp(-dot(knotOffset, knotOffset) / max(uPalmScale * uPalmScale * 2.2, .0001));
-    float transmit = uSeal * handCoverage * held * luma(irradiance) * SEAL_TRANSMIT
-      * (.3 + .7 * grazing) * depthFalloff * uPresence;
+    float transmit = uSeal * frontCoverage * held * luma(irradiance) * SEAL_TRANSMIT
+      * (.3 + .7 * grazing) * depthFalloff * uPresence * (1.0 + uSeal * .6);
     color += mix(tint, SILVER, .2) * transmit;
 
     gl_FragColor = vec4(color, 1.0);
@@ -642,6 +835,7 @@ const filamentVertexShader = /* glsl */ `
   varying float vDensity;
   varying float vDepth;
   varying float vKnot;
+  varying float vPhase;
 
   ${waveChunk}
   ${frameChunk}
@@ -668,8 +862,11 @@ const filamentVertexShader = /* glsl */ `
     float halfWidth = (span * .0045 + .0015) * mix(1.0, 5.0, step(.8, abs(uLayer)));
 
     float envelope = sin(PI * aT);
-    float lateral = y + uLayer * amp * .16 * envelope;
-    float zOffset = uLayer * amp * .6 * envelope + psi(aT, lag + 1.57) * amp * .22;
+    // Approaching collapse the layers draw in toward the central filament, so
+    // the bundle reads as intricate rather than merely smaller.
+    float condense = 1.0 - uCritical * .58;
+    float lateral = y + uLayer * amp * .16 * envelope * condense;
+    float zOffset = uLayer * amp * .6 * envelope * condense + psi(aT, lag + 1.57) * amp * .22;
     vec3 point = fieldPoint(aT, lateral, zOffset);
     vKnot = smoothstep(0.0, .7, uSeal);
     float angle = aT * PI * 2.0 + uLayer * .7 + uTime * .35;
@@ -683,6 +880,7 @@ const filamentVertexShader = /* glsl */ `
     vDepth = nearAt(point);
     vSide = aSide;
     vT = aT;
+    vPhase = psiPhase(aT, lag);
     vDensity = density(aT);
   }
 `;
@@ -698,6 +896,7 @@ const filamentFragmentShader = /* glsl */ `
   varying float vDensity;
   varying float vDepth;
   varying float vKnot;
+  varying float vPhase;
 
   ${paletteChunk}
   ${occlusionChunk}
@@ -705,9 +904,10 @@ const filamentFragmentShader = /* glsl */ `
   void main() {
     float edge = pow(max(1.0 - abs(vSide), 0.0), 1.6);
     float ends = smoothstep(0.0, .02, vT) * smoothstep(0.0, .02, 1.0 - vT);
-    // White at the antinodes where the amplitude is highest, falling back to
-    // ice along the flanks.
-    vec3 color = mix(fieldTint(uEnergy), SILVER, .42 + .4 * vDensity);
+    // Hue is the phase; brightness is the density. The antinodes still burn
+    // toward white because that is where the amplitude is, and the flanks keep
+    // the colour of whatever phase they are passing through.
+    vec3 color = mix(phaseTint(vPhase), SILVER, .06 + .3 * vDensity);
     float alpha = edge * ends * uPresence
       * (.26 + .62 * vDensity)
       * mix(1.0, .42, abs(uLayer))
@@ -731,6 +931,7 @@ const particleVertexShader = /* glsl */ `
   varying float vAlpha;
   varying float vSeed;
   varying float vDepth;
+  varying float vPhase;
 
   ${waveChunk}
   ${frameChunk}
@@ -753,7 +954,7 @@ const particleVertexShader = /* glsl */ `
     // well. Both are lit by |psi|^2, so nodes stay genuinely empty.
     float cloud = step(.55, aSeed);
     float envelope = sin(PI * aT);
-    float spread = mix(.18, .7, cloud) * envelope;
+    float spread = mix(.18, .7, cloud) * envelope * (1.0 - uCritical * .45);
     float lateral = y + aAcross * amp * spread;
     float zOffset = cos(aSeed * 31.0 + uTime * .2) * amp * .42 * envelope;
     vec3 point = fieldPoint(aT, lateral, zOffset);
@@ -762,6 +963,7 @@ const particleVertexShader = /* glsl */ `
     vec3 knot = fieldPoint(.5 + cos(swirl) * .09,
       sin(swirl) * radius, cos(swirl * 1.3) * radius - uPalmScale * .18);
     point = mix(point, knot, smoothstep(0.0, .7, uSeal));
+    vPhase = psiPhase(aT, lag);
     vDepth = nearAt(point);
     vAlpha = uPresence * density(aT)
       * mix(1.0, .55, cloud)
@@ -778,6 +980,7 @@ const particleFragmentShader = /* glsl */ `
   varying float vAlpha;
   varying float vSeed;
   varying float vDepth;
+  varying float vPhase;
 
   ${paletteChunk}
   ${occlusionChunk}
@@ -786,7 +989,9 @@ const particleFragmentShader = /* glsl */ `
     float grain = 1.0 - smoothstep(.05, .5, length(gl_PointCoord - .5));
     float alpha = grain * vAlpha * (.2 + uEnergy * .32) * visibilityAt(gl_FragCoord.xy / uRenderResolution, vDepth);
     if (alpha < .004) discard;
-    vec3 color = mix(fieldTint(uEnergy), vec3(1.0), .25 + vSeed * .3);
+    // Each grain carries the phase where it sits, so the cloud shows the wave
+    // turning over rather than a single flat tint.
+    vec3 color = mix(phaseTint(vPhase), vec3(1.0), .04 + vSeed * .2);
     gl_FragColor = vec4(color * (1.0 + uEnergy * .7), alpha);
   }
 `;
@@ -802,6 +1007,7 @@ const gradeFragmentShader = /* glsl */ `
   uniform float uTime;
   uniform float uEnergy;
   uniform float uSeal;
+  uniform float uCritical;
   uniform float uPresence;
   varying vec2 vUv;
 
@@ -820,7 +1026,7 @@ const gradeFragmentShader = /* glsl */ `
     float litArea = smoothstep(.0005, .025, luma(texture2D(tLight, vUv).rgb));
     vec2 radial = vUv - .5;
     vec2 fringe = normalize(radial + vec2(.001)) * pixel
-      * (.35 + uEnergy * 1.4 + uSeal * .6) * litArea * uPresence;
+      * (.35 + uEnergy * 1.4 + uSeal * .6 + uCritical * .8) * litArea * uPresence;
     // Very small, source-local spectral separation rather than global blur.
     vec3 color = vec3(texture2D(tDiffuse, vUv + fringe).r,
       texture2D(tDiffuse, vUv).g, texture2D(tDiffuse, vUv - fringe).b);
@@ -831,8 +1037,13 @@ const gradeFragmentShader = /* glsl */ `
       flare += sourceAt(vUv + reach) * exp(-abs(tap) * .48);
     }
     // Thin anamorphic streaks and a soft halo grow with confinement.
-    color += flare * (.035 + uEnergy * .065 + uSeal * .025) * uPresence;
-    color = mix(color, 1.0 - exp(-color), smoothstep(vec3(.42), vec3(1.35), color));
+    color += flare * (.035 + uEnergy * .065 + uSeal * .025 + uCritical * .05) * uPresence;
+    // Roll highlights off on luminance rather than per channel: mapping each
+    // channel separately pulls a bright coloured source toward white, which is
+    // where the hue was being lost.
+    float bright = luma(color);
+    float rolled = 1.0 - exp(-bright);
+    color *= mix(1.0, rolled / max(bright, 1e-4), smoothstep(.42, 1.35, bright));
     vec2 offset = vUv - .5;
     offset.x *= uResolution.x / max(uResolution.y, 1.0);
     color *= .9 + .1 * (1.0 - smoothstep(.65, 1.4, length(offset)));
@@ -853,11 +1064,14 @@ const BONES: [number, number, number][] = [
 ];
 
 const RIG_STEPS = 7;
-// Two extra instances carry the head: the skull ellipsoid and the nose.
-const HEAD_NODES = 2;
-// Ping-pong pairs for the irradiance blur. More widens the light's reach.
-const BLUR_PASSES = 6;
-const MAX_RIG_NODES = 2 * BONES.length * RIG_STEPS + HEAD_NODES + 8;
+// Ping-pong pairs for the irradiance blur. More widens the light's reach; the
+// quality profile chooses how many.
+const DEFAULT_BLUR_PASSES = 6;
+const MAX_RIG_NODES = 2 * BONES.length * RIG_STEPS + 8;
+/** Landmarks the face model can return; 468, or 478 with irises. */
+const MAX_FACE_VERTICES = 478;
+/** Cheek to cheek on the canonical face; the same figure the tracker uses. */
+const FACE_WIDTH_MM = 145;
 
 const rigVertexShader = /* glsl */ `
   varying float vNear;
@@ -953,7 +1167,12 @@ function createParticleGeometry(count: number) {
   return geometry;
 }
 
-export function createWaveEngine(canvas: HTMLCanvasElement, video: HTMLVideoElement): WaveEngine {
+export function createWaveEngine(
+  canvas: HTMLCanvasElement,
+  video: HTMLVideoElement,
+  profile: QualityProfile,
+  onFrameRate?: (fps: number) => void,
+): WaveEngine {
   const renderer = new THREE.WebGLRenderer({
     canvas,
     alpha: false,
@@ -986,6 +1205,7 @@ export function createWaveEngine(canvas: HTMLCanvasElement, video: HTMLVideoElem
   const occluderTexel = new THREE.Vector2(1 / 320, 1 / 180);
   const emission = new THREE.Vector3(1, .4, .32);
   const shared = {
+    uPhaseChroma: { value: PHASE_CHROMA },
     uResolution: { value: resolution },
     uRenderResolution: { value: new THREE.Vector2(1, 1) },
     uEndpointDepth: { value: new THREE.Vector2(.5, .5) },
@@ -1002,6 +1222,7 @@ export function createWaveEngine(canvas: HTMLCanvasElement, video: HTMLVideoElem
     uPhases: { value: phases },
     uTime: { value: 0 },
     uConfinement: { value: 0 },
+    uCritical: { value: 0 },
     uEnergy: { value: 0 },
     uPresence: { value: 0 },
     uMode: { value: 0 },
@@ -1037,14 +1258,14 @@ export function createWaveEngine(canvas: HTMLCanvasElement, video: HTMLVideoElem
     magFilter: THREE.LinearFilter,
     depthBuffer: true,
   });
-  const handTarget = rigTarget.clone();
-  shared.tOccluder.value = handTarget.texture;
+  const frontTarget = rigTarget.clone();
+  shared.tOccluder.value = frontTarget.texture;
   const palmTarget = new THREE.WebGLRenderTarget(1, 1, { depthBuffer: true });
   const palmScene = new THREE.Scene();
   const palmGeometry = new THREE.BufferGeometry();
-  // Two hands, one sector per silhouette sample, three concentric rings of
-  // that silhouette, two triangles each.
-  const PALM_VERTS = 2 * PALM_CONTOUR_POINTS * 3 * 6;
+  // Two hands: one sector per silhouette sample across three ring bands, two
+  // triangles each, plus one quad per finger bone.
+  const PALM_VERTS = 2 * (PALM_CONTOUR_POINTS * 3 * 6 + BONES.length * 6);
   const palmPositions = new Float32Array(PALM_VERTS * 3);
   const palmGlows = new Float32Array(PALM_VERTS);
   const palmFlows = new Float32Array(PALM_VERTS * 2);
@@ -1061,17 +1282,34 @@ export function createWaveEngine(canvas: HTMLCanvasElement, video: HTMLVideoElem
     uniforms: { uTime: shared.uTime, uEnergy: shared.uEnergy, uSeal: shared.uSeal },
     side: THREE.DoubleSide,
   });
-  const palmRigMaterial = new THREE.ShaderMaterial({
+  /**
+   * A landmark surface written into the geometry buffer: r is nearness, gb the
+   * screen-facing components of the normal, a coverage.
+   *
+   * The normal is the screen-space derivative of the interpolated position,
+   * which is only meaningful if z is in the same units as x and y. Nearness
+   * spans a metre and a bit over 0..1 while x and y span the viewport, so
+   * `uDepthToNdc` lifts it into their units first. Without that term every
+   * surface reports as facing the camera, which is the real reason
+   * landmark-driven relighting ends up looking like a decal.
+   *
+   * `uDepthBias` pushes the surface back before it is allowed to cut the
+   * field. Hands use none; the face, whose distance is the least certain thing
+   * in the scene, uses enough that a close call goes to the field.
+   */
+  const createSurfaceMaterial = () => new THREE.ShaderMaterial({
     vertexShader: /* glsl */ `
       varying float vDepth;
       varying vec3 vSurface;
       uniform vec2 uResolution;
+      uniform float uDepthToNdc;
+      uniform float uDepthBias;
       void main() {
-        vDepth = position.z;
-        vSurface = vec3(position.x * uResolution.x / uResolution.y, position.y, position.z * 2.0 - 1.0);
+        vDepth = position.z - uDepthBias;
+        vSurface = vec3(position.x * uResolution.x / uResolution.y, position.y, position.z * uDepthToNdc);
         // Match the rig camera's projection: world z spans -1..1 inside
         // orthographic near/far -2..2, so clip z is -world.z / 2.
-        gl_Position = vec4(position.xy, .5 - position.z, 1.0);
+        gl_Position = vec4(position.xy, .5 - vDepth, 1.0);
       }
     `,
     fragmentShader: /* glsl */ `
@@ -1081,12 +1319,18 @@ export function createWaveEngine(canvas: HTMLCanvasElement, video: HTMLVideoElem
       void main() {
         vec3 n = normalize(cross(dFdx(vSurface), dFdy(vSurface)));
         n *= n.z < 0.0 ? -1.0 : 1.0;
-        gl_FragColor = vec4(vDepth, n.xy * .5 + .5, 1.0);
+        gl_FragColor = vec4(clamp(vDepth, 0.0, 1.0), n.xy * .5 + .5, 1.0);
       }
     `,
-    uniforms: { uResolution: shared.uResolution },
+    uniforms: {
+      uResolution: shared.uResolution,
+      uDepthToNdc: { value: 1 },
+      uDepthBias: { value: 0 },
+    },
     side: THREE.DoubleSide,
   });
+  const palmRigMaterial = createSurfaceMaterial();
+  const faceSurfaceMaterial = createSurfaceMaterial();
   const palmRigMesh = new THREE.Mesh(palmGeometry, palmRigMaterial);
   palmRigMesh.frustumCulled = false;
   rigScene.add(palmRigMesh);
@@ -1094,19 +1338,45 @@ export function createWaveEngine(canvas: HTMLCanvasElement, video: HTMLVideoElem
   palmMesh.frustumCulled = false;
   palmScene.add(palmMesh);
   let trackedPalms: PalmFrame[] = [];
+  let trackedScales: number[] = [];
+  let fingerEmission = profile.fingerEmission;
+  // Where the field's light is born, in the tracker's own screen-plus-nearness
+  // space. The palm and finger surfaces are shaded against this, so the same
+  // position that draws the wave is the position that lights the hands.
+  const fieldAnchor = { x: 0, y: 0, z: .5 };
+
+  // --- Face, as an actual surface -----------------------------------------
+  // 852 triangles from the landmark tesselation, with normals taken from
+  // screen-space derivatives of the interpolated position. That is what gives
+  // a cheekbone an orientation of its own; an ellipsoid cannot have one.
+  const faceGeometry = new THREE.BufferGeometry();
+  const facePositions = new Float32Array(MAX_FACE_VERTICES * 3);
+  faceGeometry.setAttribute('position', dynamic(facePositions, 3));
+  faceGeometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 4);
+  let faceIndices: Uint16Array | null = null;
+  const faceMesh = new THREE.Mesh(faceGeometry, faceSurfaceMaterial);
+  faceMesh.frustumCulled = false;
+  faceMesh.visible = false;
+  rigScene.add(faceMesh);
 
   // Coverage the hand rig cannot reach: torso, arms, shoulders, hair. Drawn
   // first and depth-tested, so the rig's per-finger depth wins wherever the
   // two overlap and the body only fills in behind it.
   const personTexel = new THREE.Vector2(1 / 320, 1 / 180);
+  const depthTexel = new THREE.Vector2(1 / 252, 1 / 252);
+  const depthUniform = { value: null as THREE.Texture | null };
+  const hasDepthUniform = { value: 0 };
   const personMaterial = new THREE.ShaderMaterial({
     vertexShader: personVertexShader,
     fragmentShader: personFragmentShader,
     uniforms: {
       tPerson: { value: null as THREE.Texture | null },
+      tDepth: depthUniform,
       uResolution: shared.uResolution,
       uVideoSize: cameraUniforms.uVideoSize,
       uPersonTexel: { value: personTexel },
+      uDepthTexel: { value: depthTexel },
+      uHasDepth: hasDepthUniform,
       uBodyDepth: { value: .1 },
     },
   });
@@ -1117,6 +1387,9 @@ export function createWaveEngine(canvas: HTMLCanvasElement, video: HTMLVideoElem
   rigScene.add(personMesh);
   let personTexture: THREE.DataTexture | null = null;
   let personVersion = -1;
+  let personPacked = new Uint8Array(0);
+  let depthTexture: THREE.DataTexture | null = null;
+  let depthVersion = -1;
 
   const rigMesh = new THREE.InstancedMesh(
     new THREE.SphereGeometry(1, 12, 8),
@@ -1185,7 +1458,12 @@ export function createWaveEngine(canvas: HTMLCanvasElement, video: HTMLVideoElem
       tPalm: { value: palmTarget.texture },
       tLight: { value: blurTargets[0].texture },
       tOccluder: { value: rigTarget.texture },
-      tHandOccluder: { value: handTarget.texture },
+      tFrontOccluder: { value: frontTarget.texture },
+      tPerson: { value: null as THREE.Texture | null },
+      tDepth: depthUniform,
+      uVideoSize: cameraUniforms.uVideoSize,
+      uHasDepth: hasDepthUniform,
+      uHasSkin: { value: 0 },
       uOccluderTexel: { value: occluderTexel },
       uLightTexel: { value: lightTexel },
       uHasOccluder: { value: 0 },
@@ -1218,7 +1496,8 @@ export function createWaveEngine(canvas: HTMLCanvasElement, video: HTMLVideoElem
     emissiveScene.add(strand);
   }
 
-  const fullParticleCount = window.innerWidth < 720 ? 3600 : 8000;
+  let blurPasses = Math.max(1, Math.min(profile.blurPasses, DEFAULT_BLUR_PASSES));
+  const fullParticleCount = Math.min(profile.particles, window.innerWidth < 720 ? 3600 : 8000);
   const particleGeometry = createParticleGeometry(fullParticleCount);
   const particleMaterial = new THREE.ShaderMaterial({
     vertexShader: particleVertexShader,
@@ -1253,13 +1532,13 @@ export function createWaveEngine(canvas: HTMLCanvasElement, video: HTMLVideoElem
   gradePass.uniforms.tLight = { value: blurTargets[1].texture };
   gradePass.uniforms.uEnergy = { value: 0 };
   gradePass.uniforms.uSeal = { value: 0 };
+  gradePass.uniforms.uCritical = { value: 0 };
   gradePass.uniforms.uPresence = { value: 0 };
   composer.addPass(gradePass);
 
   // Landmarks as delivered by the tracker, in screen pixels with nearness.
-  let rigHands: { x: number; y: number; z: number }[][] = [];
+  let rigHands: RigPoint[][] = [];
   let rigFace: FieldTracking['face'] = null;
-  const rigBasis = new THREE.Matrix4();
 
   const target = {
     left: new THREE.Vector2(-.34, 0),
@@ -1279,6 +1558,7 @@ export function createWaveEngine(canvas: HTMLCanvasElement, video: HTMLVideoElem
   let currentSeal = 0;
   let currentPulse = 0;
   let currentFacing = 0;
+  let currentCritical = 0;
   let occluderActive = false;
   let handRigCount = 0;
   let lastTrackingAt = 0;
@@ -1322,10 +1602,10 @@ export function createWaveEngine(canvas: HTMLCanvasElement, video: HTMLVideoElem
     // emission from moving palms; copy them and ease only appearance.
     currentLeft.copy(target.left);
     currentRight.copy(target.right);
-    currentConfinement += (target.confinement - currentConfinement) * easing(.1);
+    currentConfinement += (target.confinement - currentConfinement) * easing(.055);
     currentPresence += (target.presence - currentPresence) * easing(.12);
     currentMode += (target.mode - currentMode) * easing(.12);
-    currentSeal += (target.seal - currentSeal) * easing(.09);
+    currentSeal += (target.seal - currentSeal) * easing(.05);
     // The impulse already decays in the state machine; follow it closely.
     currentPulse += (target.pulse - currentPulse) * easing(.04);
     currentFacing += (target.facing - currentFacing) * easing(.1);
@@ -1336,14 +1616,29 @@ export function createWaveEngine(canvas: HTMLCanvasElement, video: HTMLVideoElem
 
     // The room falls dark as the well tightens, so the field ends up being
     // nearly the only light in it.
-    // An explicitly artistic spectral palette, not predicted emission.
-    // Scarlet with a warm white core. This is an artistic energy cue.
-    emission.set(1.0, .045 + energy * .12, .12 + energy * .025);
+    //
+    // The source's colour by state, chosen rather than predicted: a broad
+    // state spills faint ice-blue, confinement drives it through silver to a
+    // neutral white core, and only at high confinement does a little warmth
+    // enter -- pale gold, kept well short of amber. The core stays neutral on
+    // purpose. A bright source landing on skin reads as white with colour in
+    // its falloff, and a saturated tint over a whole hand reads as a filter.
+    const source = emissionFor(energy, currentSeal);
+    emission.set(source.r, source.g, source.b);
     shared.uAmbient.value = .76 - currentPresence * (.12 + energy * .12);
     shared.uSeal.value = target.state === 'clasped' ? Math.max(currentSeal, .7) : currentSeal;
 
+    // Near collapse: the well is very narrow and nothing is sealed yet. Taken
+    // continuously off the dial rather than off the state flag, so the
+    // treatment ramps in with the gesture; the flag exists for the copy, which
+    // does need a discrete name for it.
+    const nearCollapse = THREE.MathUtils.smoothstep(currentConfinement, .58, .95)
+      * (1 - THREE.MathUtils.smoothstep(shared.uSeal.value, .72, 1));
+    currentCritical += (nearCollapse - currentCritical) * easing(.07);
+
     shared.uTime.value = time;
     shared.uConfinement.value = currentConfinement;
+    shared.uCritical.value = currentCritical;
     shared.uEnergy.value = energy;
     // Palms turned edge-on stop presenting a face for the field to span, so it
     // weakens rather than clinging to the tracked points. The floor is high
@@ -1359,8 +1654,10 @@ export function createWaveEngine(canvas: HTMLCanvasElement, video: HTMLVideoElem
     gradePass.uniforms.uResolution.value.copy(resolution);
     gradePass.uniforms.uEnergy.value = energy;
     gradePass.uniforms.uSeal.value = shared.uSeal.value;
+    gradePass.uniforms.uCritical.value = currentCritical;
     gradePass.uniforms.uPresence.value = shared.uPresence.value;
-    bloomPass.strength = .22 + energy * .34 + currentSeal * .12 + currentPulse * .12;
+    bloomPass.strength = .22 + energy * .34 + currentSeal * .12 + currentPulse * .12
+      + currentCritical * .2;
     bloomPass.radius = .58 + energy * .18;
   }
 
@@ -1402,48 +1699,27 @@ export function createWaveEngine(canvas: HTMLCanvasElement, video: HTMLVideoElem
       }
     }
     handRigCount = index;
-    // Head and body proxies relight the camera only. They never mask the wave.
-    // Apparent face width measures the distance to the front of the face, not
-    // to the middle of the skull, so each ellipsoid is seated back by its own
-    // half-thickness. Without this the head bulges a half-thickness nearer
-    // than it was measured and swallows a field held right in front of it.
-    const HEAD_HALF_DEPTH = .09;
-    const NOSE_HALF_DEPTH = .025;
-    if (rigFace && index + HEAD_NODES <= MAX_RIG_NODES) {
-      const b = rigFace.basis;
-      rigBasis.set(
-        b[0], b[3], b[6], 0,
-        -b[1], -b[4], -b[7], 0,
-        b[2], b[5], b[8], 0,
-        0, 0, 0, 1,
-      );
-      rigQuaternion.setFromRotationMatrix(rigBasis);
-      rigPosition.set(
-        (rigFace.center.x / width * 2 - 1) * aspect,
-        1 - rigFace.center.y / height * 2,
-        rigFace.depth * 2 - 1 - HEAD_HALF_DEPTH,
-      );
-      const unitY = 2 / Math.max(height, 1);
-      rigScale.set(rigFace.radiusX * unitY, rigFace.radiusY * unitY, HEAD_HALF_DEPTH);
-      rigMatrix.compose(rigPosition, rigQuaternion, rigScale);
-      rigMesh.setMatrixAt(index, rigMatrix);
-      index += 1;
 
-      rigQuaternion.identity();
-      rigPosition.set(
-        (rigFace.nose.x / width * 2 - 1) * aspect,
-        1 - rigFace.nose.y / height * 2,
-        rigFace.nose.z * 2 - 1 - NOSE_HALF_DEPTH,
-      );
-      rigScale.set(rigFace.nose.radius * unitY, rigFace.nose.radius * unitY, NOSE_HALF_DEPTH);
-      rigMatrix.compose(rigPosition, rigQuaternion, rigScale);
-      rigMesh.setMatrixAt(index, rigMatrix);
-      index += 1;
+    // Metric scaling for the derivative normals. The tracker reports, per
+    // hand, how many screen pixels one unit of nearness is worth at that
+    // distance; converting that to viewport units puts z in the same units as
+    // x and y, which is the only condition under which a screen-space
+    // derivative is a surface normal at all.
+    const ndcPerPixel = 2 / Math.max(height, 1);
+    const pixelsPerNearness = trackedScales.length
+      ? trackedScales.reduce((sum, value) => sum + value, 0) / trackedScales.length
+      : height * 2;
+    palmRigMaterial.uniforms.uDepthToNdc.value = pixelsPerNearness * ndcPerPixel;
+    if (rigFace) {
+      // Same construction for the head, from its own measured apparent width.
+      const facePixelsPerMm = rigFace.radiusX * 2 / FACE_WIDTH_MM;
+      faceSurfaceMaterial.uniforms.uDepthToNdc.value =
+        NEARNESS_SPAN_MM * facePixelsPerMm * ndcPerPixel;
     }
 
     rigMesh.count = index;
     rigMesh.instanceMatrix.needsUpdate = true;
-    occluderActive = index > 0 || personMesh.visible;
+    occluderActive = index > 0 || personMesh.visible || faceMesh.visible;
     rigCamera.left = -aspect;
     rigCamera.right = aspect;
     rigCamera.updateProjectionMatrix();
@@ -1452,54 +1728,59 @@ export function createWaveEngine(canvas: HTMLCanvasElement, video: HTMLVideoElem
   }
 
   /**
-   * Twice the area the silhouette encloses over the area of the disc that
-   * would fit its longest reach. A palm turned edge-on, or curled into a fist,
-   * collapses its own outline; this reads that directly off the landmarks in
-   * screen space, with no normal and no mixed units.
+   * The palm as a lit surface. Rings are offset inward along the silhouette's
+   * own normal rather than scaled toward a centre point: scaling drives any
+   * outline to a disc as it shrinks, so the bright core -- which is the part
+   * the eye actually reads -- ends up circular however good the outline was.
+   * Offsetting keeps the palm's shape all the way in.
+   *
+   * Brightness is N.L against the real field position, in a space where the
+   * landmarks' nearness has been scaled into the same units as their pixels.
+   * A palm turned edge-on therefore dims because it is turned away, not only
+   * because its outline has collapsed.
    */
-  function palmOpenness(palm: PalmFrame) {
-    const contour = palm.contour;
-    let area = 0;
-    for (let i = 0; i < contour.length; i += 1) {
-      const a = contour[i];
-      const b = contour[(i + 1) % contour.length];
-      area += a.x * b.y - b.x * a.y;
-    }
-    const disc = Math.PI * palm.radius * palm.radius;
-    return Math.min(Math.abs(area) / 2 / Math.max(disc, 1e-6) * 1.9, 1);
+  const PALM_RINGS = [0, .2, .5, .82];
+  const RING_GLOW = [0, .92, 1, .62];
+
+  function lightAt(
+    px: number, py: number, pz: number,
+    normal: RigPoint, scale: number, radius: number,
+  ) {
+    const dx = fieldAnchor.x - px;
+    const dy = fieldAnchor.y - py;
+    const dz = (fieldAnchor.z - pz) * scale;
+    const distance = Math.hypot(dx, dy, dz) || 1;
+    const nDotL = (normal.x * dx + normal.y * dy + normal.z * dz) / distance;
+    // A little wrap, so a surface just past the terminator is not black. The
+    // field is a broad near-field source, not a point at infinity.
+    const wrapped = Math.max((nDotL + .28) / 1.28, 0);
+    const reach = radius * 4.5;
+    return wrapped / (1 + (distance * distance) / (reach * reach));
   }
 
   function buildPalmSurfaces() {
     let count = 0;
-    const rings = [0, .42, .74, 1];
-    const glows = [1, .84, .3, 0];
     const palms = trackedPalms.slice(0, 2);
-    const emit = (
-      palm: PalmFrame,
-      toField: { x: number; y: number },
-      openness: number,
-      corner: number,
-      ring: number,
+    const push = (
+      point: { x: number; y: number; z: number },
+      glow: number,
+      angle: number,
+      ringT: number,
+      field: number,
     ) => {
-      const samples = palm.contour.length;
-      const index = ((corner % samples) + samples) % samples;
-      const edge = palm.contour[index];
-      const amount = rings[ring];
-      const outX = edge.x - palm.center.x;
-      const outY = edge.y - palm.center.y;
-      const reach = Math.hypot(outX, outY) || 1;
-      palmPositions[count * 3] = (palm.center.x + outX * amount) / width * 2 - 1;
-      palmPositions[count * 3 + 1] = 1 - (palm.center.y + outY * amount) / height * 2;
-      palmPositions[count * 3 + 2] = palm.center.z + (edge.z - palm.center.z) * amount;
-      palmGlows[count] = glows[ring] * openness;
-      palmFlows[count * 2] = index / samples * Math.PI * 2;
-      palmFlows[count * 2 + 1] = amount;
-      // Which part of the rim faces the way the field leaves the hand.
-      palmFields[count] = .5 + .5 * (outX * toField.x + outY * toField.y) / reach;
+      if (count >= PALM_VERTS) return;
+      palmPositions[count * 3] = point.x / width * 2 - 1;
+      palmPositions[count * 3 + 1] = 1 - point.y / height * 2;
+      palmPositions[count * 3 + 2] = point.z;
+      palmGlows[count] = glow;
+      palmFlows[count * 2] = angle;
+      palmFlows[count * 2 + 1] = ringT;
+      palmFields[count] = field;
       count += 1;
     };
 
     palms.forEach((palm, index) => {
+      const scale = trackedScales[index] ?? 0;
       const other = palms[1 - index];
       // Toward the opposite palm when there are two; otherwise out along the
       // hand's own long axis, which is where a single-hand pinch sits.
@@ -1508,16 +1789,68 @@ export function createWaveEngine(canvas: HTMLCanvasElement, video: HTMLVideoElem
         : { x: palm.up.x, y: palm.up.y };
       const length = Math.hypot(axis.x, axis.y) || 1;
       const toField = { x: axis.x / length, y: axis.y / length };
-      const openness = palmOpenness(palm);
-      for (let edge = 0; edge < palm.contour.length; edge += 1) {
-        for (let ring = 0; ring < 3; ring += 1) {
-          emit(palm, toField, openness, edge, ring);
-          emit(palm, toField, openness, edge, ring + 1);
-          emit(palm, toField, openness, edge + 1, ring + 1);
-          emit(palm, toField, openness, edge, ring);
-          emit(palm, toField, openness, edge + 1, ring + 1);
-          emit(palm, toField, openness, edge + 1, ring);
+
+      const rings = PALM_RINGS.map(fraction =>
+        fraction === 0 ? palm.contour : insetContour(palm, palm.radius * fraction));
+      const samples = palm.contour.length;
+      const facing = lightAt(palm.center.x, palm.center.y, palm.center.z, palm.normal, scale, palm.radius);
+      const surface = facing * palm.openness;
+
+      const vertex = (corner: number, ring: number) => {
+        const i = ((corner % samples) + samples) % samples;
+        const point = rings[ring][i];
+        const outX = palm.contour[i].x - palm.center.x;
+        const outY = palm.contour[i].y - palm.center.y;
+        const reach = Math.hypot(outX, outY) || 1;
+        // Which part of the rim faces the way the field leaves the hand.
+        const field = .5 + .5 * (outX * toField.x + outY * toField.y) / reach;
+        push(point, RING_GLOW[ring] * surface, i / samples * Math.PI * 2, 1 - PALM_RINGS[ring], field);
+      };
+
+      for (let edge = 0; edge < samples; edge += 1) {
+        for (let ring = 0; ring < rings.length - 1; ring += 1) {
+          vertex(edge, ring);
+          vertex(edge, ring + 1);
+          vertex(edge + 1, ring + 1);
+          vertex(edge, ring);
+          vertex(edge + 1, ring + 1);
+          vertex(edge + 1, ring);
         }
+      }
+
+      // Fingers, as their own quads along the bones. Each segment is shaded at
+      // its own midpoint, so a finger reaching toward the field brightens on
+      // its own while the one behind it does not -- which is the difference
+      // between a lit hand and a lit blob.
+      const hand = rigHands[index];
+      if (!fingerEmission || !hand || hand.length < 21) return;
+      const unit = Math.max(
+        Math.hypot(hand[5].x - hand[17].x, hand[5].y - hand[17].y),
+        Math.hypot(hand[0].x - hand[9].x, hand[0].y - hand[9].y) * .78,
+      );
+      for (const [from, to, weight] of BONES) {
+        const a = hand[from];
+        const b = hand[to];
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const span = Math.hypot(dx, dy) || 1;
+        const half = unit * weight * .5;
+        const nx = -dy / span * half;
+        const ny = dx / span * half;
+        const midGlow = lightAt((a.x + b.x) / 2, (a.y + b.y) / 2, (a.z + b.z) / 2,
+          palm.normal, scale, palm.radius) * palm.openness * .85;
+        const angle = Math.atan2(dy, dx) + Math.PI;
+        const corners = [
+          { x: a.x + nx, y: a.y + ny, z: a.z },
+          { x: a.x - nx, y: a.y - ny, z: a.z },
+          { x: b.x - nx, y: b.y - ny, z: b.z },
+          { x: b.x + nx, y: b.y + ny, z: b.z },
+        ];
+        const emit = (corner: number, ringT: number) =>
+          push(corners[corner], midGlow, angle, ringT, .72);
+        // Bright along the spine of the bone, falling off at its edges.
+        emit(0, .1); emit(1, .1); emit(2, .1);
+        emit(0, .1); emit(2, .1); emit(3, .1);
       }
     });
 
@@ -1530,28 +1863,96 @@ export function createWaveEngine(canvas: HTMLCanvasElement, video: HTMLVideoElem
       ? palms.reduce((sum, palm) => sum + palm.radius, 0) / palms.length / height * 2 : .08;
   }
 
-  /** Upload a new silhouette, reallocating only when its size changes. */
+  /**
+   * Push the tracked face landmarks into the mesh the compositor lights.
+   *
+   * The hull is grown about the face's own centre before it is written. The
+   * landmarks stop at the edge of the face, so the mesh alone leaves the
+   * hairline, the jaw and the neck unlit -- a lit oval floating on an unlit
+   * head. Since this surface only ever lights and never occludes, growing it
+   * costs nothing and covers what the landmarks do not reach.
+   */
+  const FACE_LIGHT_EXPAND = 1.22;
+
+  function buildFaceSurface() {
+    if (!rigFace || !faceIndices) {
+      faceMesh.visible = false;
+      return;
+    }
+    const source = rigFace.vertices;
+    const vertices = Math.min(rigFace.count, facePositions.length / 3);
+    const centerX = rigFace.center.x;
+    const centerY = rigFace.center.y;
+    for (let i = 0; i < vertices; i += 1) {
+      const x = centerX + (source[i * 3] - centerX) * FACE_LIGHT_EXPAND;
+      const y = centerY + (source[i * 3 + 1] - centerY) * FACE_LIGHT_EXPAND;
+      facePositions[i * 3] = x / width * 2 - 1;
+      facePositions[i * 3 + 1] = 1 - y / height * 2;
+      facePositions[i * 3 + 2] = source[i * 3 + 2];
+    }
+    faceGeometry.attributes.position.needsUpdate = true;
+    faceMesh.visible = true;
+  }
+
+  /**
+   * Upload a new silhouette, reallocating only when its size changes. Coverage
+   * and skin travel together in one two-channel texture: the composite uses
+   * the skin channel to keep a synthetic highlight on skin rather than
+   * spreading it evenly over hair and clothing, which reflect nothing like it.
+   */
   function updatePersonMask(mask: FieldTracking['person'], bodyDepth: number) {
     if (!mask) {
       personMesh.visible = false;
       return;
     }
+    const pixels = mask.width * mask.height;
     const image = personTexture?.image as { width: number; height: number } | undefined;
     if (!personTexture || image?.width !== mask.width || image?.height !== mask.height) {
       personTexture?.dispose();
-      personTexture = new THREE.DataTexture(mask.data, mask.width, mask.height, THREE.RedFormat);
+      personPacked = new Uint8Array(pixels * 2);
+      personTexture = new THREE.DataTexture(personPacked, mask.width, mask.height, THREE.RGFormat);
       personTexture.minFilter = THREE.LinearFilter;
       personTexture.magFilter = THREE.LinearFilter;
       personTexture.unpackAlignment = 1;
       personMaterial.uniforms.tPerson.value = personTexture;
+      compositeMaterial.uniforms.tPerson.value = personTexture;
       personVersion = -1;
     }
     if (mask.version !== personVersion) {
       personVersion = mask.version;
+      for (let i = 0; i < pixels; i += 1) {
+        personPacked[i * 2] = mask.data[i];
+        personPacked[i * 2 + 1] = mask.skin[i];
+      }
       personTexture.needsUpdate = true;
     }
+    compositeMaterial.uniforms.uHasSkin.value = mask.multiclass ? 1 : 0;
     personMaterial.uniforms.uBodyDepth.value = bodyDepth;
     personMesh.visible = true;
+  }
+
+  /** Upload the aligned dense depth map, when the depth model is running. */
+  function updateDepthMap(map: FieldTracking['depth']) {
+    if (!map) {
+      hasDepthUniform.value = 0;
+      return;
+    }
+    const image = depthTexture?.image as { width: number; height: number } | undefined;
+    if (!depthTexture || image?.width !== map.width || image?.height !== map.height) {
+      depthTexture?.dispose();
+      depthTexture = new THREE.DataTexture(map.data, map.width, map.height, THREE.RedFormat);
+      depthTexture.minFilter = THREE.LinearFilter;
+      depthTexture.magFilter = THREE.LinearFilter;
+      depthTexture.unpackAlignment = 1;
+      depthUniform.value = depthTexture;
+      depthTexel.set(1 / map.width, 1 / map.height);
+      depthVersion = -1;
+    }
+    if (map.version !== depthVersion) {
+      depthVersion = map.version;
+      depthTexture.needsUpdate = true;
+    }
+    hasDepthUniform.value = 1;
   }
 
   function resize() {
@@ -1564,7 +1965,7 @@ export function createWaveEngine(canvas: HTMLCanvasElement, video: HTMLVideoElem
     // The rig only needs enough resolution to resolve a finger edge.
     const rigWidth = Math.max(Math.round(Math.min(width, 960)), 2);
     rigTarget.setSize(rigWidth, Math.max(Math.round(rigWidth * height / Math.max(width, 1)), 2));
-    handTarget.setSize(rigTarget.width, rigTarget.height);
+    frontTarget.setSize(rigTarget.width, rigTarget.height);
     occluderTexel.set(1 / rigTarget.width, 1 / rigTarget.height);
     personTexel.copy(occluderTexel);
 
@@ -1590,6 +1991,7 @@ export function createWaveEngine(canvas: HTMLCanvasElement, video: HTMLVideoElem
     const elapsed = now - fpsWindowStart;
     if (elapsed < 1800) return;
     const fps = fpsFrames * 1000 / elapsed;
+    onFrameRate?.(fps);
     lowFpsWindows = fps < 47 ? lowFpsWindows + 1 : 0;
     if (lowFpsWindows >= 2 && renderedParticleCount > 2400) {
       renderedParticleCount = Math.max(2400, Math.floor(renderedParticleCount * .68));
@@ -1600,6 +2002,34 @@ export function createWaveEngine(canvas: HTMLCanvasElement, video: HTMLVideoElem
     fpsWindowStart = now;
   }
 
+  /**
+   * Compile every program once, before anything needs it. The face mesh and
+   * the person plane are hidden until their models produce something, so
+   * without this their shaders would first be built at the moment a face walks
+   * into frame -- which is a visible hitch, and the worst possible time to
+   * discover a shader will not link.
+   */
+  function warmUp() {
+    const faceWasVisible = faceMesh.visible;
+    const personWasVisible = personMesh.visible;
+    const personTextureWas = personMaterial.uniforms.tPerson.value;
+    const warmTexture = new THREE.DataTexture(new Uint8Array([0, 0]), 1, 1, THREE.RGFormat);
+    warmTexture.needsUpdate = true;
+    personMaterial.uniforms.tPerson.value = personTextureWas ?? warmTexture;
+    faceMesh.visible = true;
+    personMesh.visible = true;
+    renderer.setRenderTarget(rigTarget);
+    renderer.setClearColor(0x000000, 0);
+    renderer.clear();
+    renderer.render(rigScene, rigCamera);
+    faceMesh.visible = faceWasVisible;
+    personMesh.visible = personWasVisible;
+    personMaterial.uniforms.tPerson.value = personTextureWas;
+    warmTexture.dispose();
+    renderer.setClearColor(0x010304, 1);
+    renderer.setRenderTarget(null);
+  }
+
   function render(now: number) {
     if (destroyed) return;
     timer.update(now);
@@ -1607,7 +2037,8 @@ export function createWaveEngine(canvas: HTMLCanvasElement, video: HTMLVideoElem
     const delta = Math.min(timer.getDelta(), .05);
     if (lastTrackingAt && now - lastTrackingAt > 500) {
       target.presence = 0; target.state = 'dormant'; target.seal = 0; target.pulse = 0;
-      rigHands = []; rigFace = null; trackedPalms = []; buildPalmSurfaces();
+      rigHands = []; rigFace = null; trackedPalms = []; trackedScales = [];
+      buildPalmSurfaces(); buildFaceSurface();
       updatePersonMask(null, .1);
     }
     if (video.videoWidth > 0 && video.videoHeight > 0) {
@@ -1620,22 +2051,33 @@ export function createWaveEngine(canvas: HTMLCanvasElement, video: HTMLVideoElem
     renderer.render(envScene, camera);
 
     // The rig is cleared to fully transparent so coverage reads as alpha.
+    // Pass one is every surface in the scene, at its measured distance: it is
+    // what the composite lights.
     buildRig();
+    faceSurfaceMaterial.uniforms.uDepthBias.value = 0;
     renderer.setRenderTarget(rigTarget);
     renderer.setClearColor(0x000000, 0);
     renderer.clear();
     if (occluderActive) renderer.render(rigScene, rigCamera);
-    // A second, hand-only depth target is the authority for field visibility.
-    // Face/person depth is too uncertain for cutting a luminous strand.
+
+    // Pass two decides what may cut the field, and only the hands qualify.
+    // The face is deliberately absent: the wave passes across a face rather
+    // than behind it, so the head lights but never occludes. The person
+    // silhouette is out too -- a mask carries no depth of its own -- and so is
+    // the dense depth map, which is smooth across exactly the boundaries
+    // occlusion depends on.
     const allNodes = rigMesh.count;
     const personWasVisible = personMesh.visible;
+    const faceWasVisible = faceMesh.visible;
     rigMesh.count = handRigCount;
     personMesh.visible = false;
-    renderer.setRenderTarget(handTarget);
+    faceMesh.visible = false;
+    renderer.setRenderTarget(frontTarget);
     renderer.clear();
     if (handRigCount > 0) renderer.render(rigScene, rigCamera);
     rigMesh.count = allNodes;
     personMesh.visible = personWasVisible;
+    faceMesh.visible = faceWasVisible;
 
     // The wave's own light, then the same buffer blurred down into the
     // irradiance the composite lights the room with.
@@ -1649,7 +2091,7 @@ export function createWaveEngine(canvas: HTMLCanvasElement, video: HTMLVideoElem
     renderer.render(emissiveScene, camera);
 
     blurMaterial.uniforms.tSource.value = emissiveTarget.texture;
-    for (let pass = 0; pass < BLUR_PASSES; pass += 1) {
+    for (let pass = 0; pass < blurPasses; pass += 1) {
       const reach = 1 + pass * 2.4;
       for (let axis = 0; axis < 2; axis += 1) {
         const from = pass === 0 && axis === 0 ? emissiveTarget : blurTargets[(axis + 1) % 2];
@@ -1680,15 +2122,31 @@ export function createWaveEngine(canvas: HTMLCanvasElement, video: HTMLVideoElem
   }
 
   resize();
+  warmUp();
   window.addEventListener('resize', resize);
   animationFrame = requestAnimationFrame(render);
 
   return {
+    setProfile(next) {
+      blurPasses = Math.max(1, Math.min(next.blurPasses, DEFAULT_BLUR_PASSES));
+      fingerEmission = next.fingerEmission;
+      if (next.particles < renderedParticleCount) {
+        renderedParticleCount = next.particles;
+        particleGeometry.setDrawRange(0, renderedParticleCount);
+      }
+    },
     setTracking(tracking) {
       lastTrackingAt = performance.now();
       target.state = tracking.state;
       target.endpointDepth.set(tracking.leftDepth, tracking.rightDepth);
       trackedPalms = tracking.palms;
+      trackedScales = tracking.handScale;
+      rigHands = tracking.rig;
+      // The field's light is born where the wave is anchored, so the surfaces
+      // are shaded against the same position the wave is drawn from.
+      fieldAnchor.x = (tracking.left.x + tracking.right.x) * .5;
+      fieldAnchor.y = (tracking.left.y + tracking.right.y) * .5;
+      fieldAnchor.z = (tracking.leftDepth + tracking.rightDepth) * .5;
       buildPalmSurfaces();
       target.confinement = THREE.MathUtils.clamp(tracking.confinement, 0, 1);
       target.presence = THREE.MathUtils.clamp(tracking.presence, 0, 1);
@@ -1696,16 +2154,21 @@ export function createWaveEngine(canvas: HTMLCanvasElement, video: HTMLVideoElem
       target.seal = THREE.MathUtils.clamp(tracking.seal, 0, 1);
       target.pulse = THREE.MathUtils.clamp(tracking.pulse, 0, 1);
       target.facing = THREE.MathUtils.clamp(tracking.facing, 0, 1);
-      rigHands = tracking.rig;
       rigFace = tracking.face;
+      if (tracking.faceTriangles && faceIndices !== tracking.faceTriangles) {
+        faceIndices = tracking.faceTriangles;
+        faceGeometry.setIndex(new THREE.BufferAttribute(faceIndices, 1));
+      }
+      buildFaceSurface();
       updatePersonMask(tracking.person, tracking.bodyDepth);
+      updateDepthMap(tracking.depth);
       target.left.set(tracking.left.x / width * 2 - 1, 1 - tracking.left.y / height * 2);
       target.right.set(tracking.right.x / width * 2 - 1, 1 - tracking.right.y / height * 2);
     },
     destroy() {
       destroyed = true;
       rigTarget.dispose();
-      handTarget.dispose();
+      frontTarget.dispose();
       rigMesh.geometry.dispose();
       (rigMesh.material as THREE.Material).dispose();
       cancelAnimationFrame(animationFrame);
@@ -1727,8 +2190,11 @@ export function createWaveEngine(canvas: HTMLCanvasElement, video: HTMLVideoElem
       palmGeometry.dispose();
       palmMaterial.dispose();
       palmRigMaterial.dispose();
+      faceSurfaceMaterial.dispose();
+      faceGeometry.dispose();
       personMaterial.dispose();
       personTexture?.dispose();
+      depthTexture?.dispose();
       blurTargets.forEach((t) => t.dispose());
       filamentGeometry.dispose();
       filamentMaterials.forEach((material) => material.dispose());

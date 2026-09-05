@@ -69,6 +69,16 @@ export function normalisedEnergy(confinement: number): number {
 }
 
 /**
+ * Dp/Dp0 for a fixed mode, which is exactly L0/L: 1 open, 2 when the width has
+ * halved. This is the mechanism the energy ratio is a consequence of -- Dp =
+ * n pi hbar / L, so the spread widens by precisely the factor the box narrows
+ * by, and E, going as Dp^2, rises by its square.
+ */
+export function momentumRatio(confinement: number): number {
+  return 1 / relativeWellWidth(confinement);
+}
+
+/**
  * Wavelength to display colour, after Bruton's piecewise approximation of the
  * visible spectrum. This is a perceptual approximation for showing a spectrum,
  * not a colorimetric transform, and the wavelength it is fed is a chosen visual

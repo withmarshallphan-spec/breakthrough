@@ -3,9 +3,29 @@ import { Vector2 } from 'three';
 type Point = { x: number; y: number; z?: number };
 
 import { createFieldStateMachine, type FieldState } from './field-state';
-import { buildPalmFrame, fieldDepthFromEndpoints, nearnessFromDistance, type PalmFrame, type RigPoint } from './palm-geometry';
+import {
+  buildPalmFrame,
+  containsPoint,
+  fieldDepthFromEndpoints,
+  nearnessFromDistance,
+  NEARNESS_SPAN_MM,
+  type PalmFrame,
+  type RigPoint,
+} from './palm-geometry';
+import { buildFaceFrame, trianglesFromTesselation, type FaceFrame } from './face-geometry';
 import { createPersonSegmenter, type PersonMask, type PersonSegmenter } from './segmentation';
-export type { FieldState, PalmFrame, PersonMask, RigPoint };
+import {
+  applyFit,
+  createDepthEstimator,
+  fitAffine,
+  type AffineFit,
+  type DepthEstimator,
+  type DepthMap,
+  type DepthSample,
+} from './depth-field';
+import { createGuideLine } from './guide-line';
+import type { QualityController } from './quality';
+export type { FaceFrame, FieldState, PalmFrame, PersonMask, RigPoint, DepthMap };
 
 export type TrackingUpdate = {
   confinement: number;
@@ -29,37 +49,60 @@ export type TrackingUpdate = {
   rightDepth: number;
   /** 21 landmarks per hand, screen space with depth, for the occlusion rig. */
   rig: RigPoint[][];
-  /** Head proxy, when a face is visible. */
-  face: FaceProxy | null;
+  /** Millimetres per unit of nearness at each hand, for metric-space normals. */
+  handScale: number[];
+  /** The head as a real surface, when a face is visible. */
+  face: FaceFrame | null;
+  /** Shared triangle list for the face mesh; stable for the session. */
+  faceTriangles: Uint16Array | null;
   /** Whole-person coverage, when the segmenter is available. */
   person: PersonMask | null;
+  /** Dense depth on the rig's nearness scale, when the depth model is running. */
+  depth: DepthMap | null;
   /**
-   * Nearness the person silhouette is composited at. Segmentation has no depth
-   * of its own, so the measured head distance stands in for the whole body.
+   * Nearness the person silhouette is composited at when there is no dense
+   * depth. Segmentation has no depth of its own, so the measured head distance
+   * stands in for the whole body.
    */
   bodyDepth: number;
+  /** How certain the tracker is, 0 to 1. Drives the guide line's marker. */
+  confidence: number;
+  /**
+   * Where the text block that describes the state should sit, and which side of
+   * the hand it ended up on. The tracker places it because it is also drawing
+   * the leader that connects the two: one owner, so the line always meets the
+   * text.
+   *
+   * Never null. The block does not come and go with the tracking -- when the
+   * hands leave it simply stays where it was, and glides back when they return.
+   */
+  callout: { x: number; y: number; side: 'left' | 'right' };
 };
+
+/** Reserved size of the callout, in CSS pixels. Keep in step with the CSS. */
+const CALLOUT_WIDTH = 280;
+const CALLOUT_HEIGHT = 232;
+/** Gap between the tracked dot and the near edge of the text. */
+const CALLOUT_GAP = 54;
+const CALLOUT_PAD = 38;
+/**
+ * How slowly the block follows the hand, in seconds. Deliberately far slower
+ * than the tracking: the landmarks are already filtered, but a block of text
+ * pinned rigidly to a moving hand reads as panic however smooth the underlying
+ * signal is. This lags on purpose.
+ */
+const CALLOUT_TAU = .21;
+/**
+ * How far past the point of no room the hand has to travel before the block
+ * changes sides, in pixels. Without it, a hand hovering at the edge of the
+ * frame flips the text back and forth.
+ */
+const CALLOUT_SWITCH_HYSTERESIS = 110;
 
 export type HandTracker = {
   setDebug: (enabled: boolean) => void;
+  setGuide: (enabled: boolean) => void;
   destroy: () => void;
-};
-
-
-/**
- * A head proxy for lighting and occlusion. Its depth comes from apparent size
- * against a known face width, the same measure used for the hands, so the two
- * sit on one distance scale and the light falls off between them correctly.
- */
-export type FaceProxy = {
-  center: { x: number; y: number };
-  radiusX: number;
-  radiusY: number;
-  radiusZ: number;
-  /** Column-major 3x3 basis: right, up, forward. */
-  basis: number[];
-  depth: number;
-  nose: { x: number; y: number; z: number; radius: number };
 };
 
 const connections = [
@@ -71,6 +114,7 @@ const connections = [
 ];
 
 const PALM_IDS = [0, 1, 5, 9, 13, 17];
+const FINGERTIPS = [4, 8, 12, 16, 20];
 
 /**
  * Depth from apparent size. A hand and a face are seen through the same lens,
@@ -79,7 +123,6 @@ const PALM_IDS = [0, 1, 5, 9, 13, 17];
  * values, being per-model and relative to their own origin, cannot do.
  */
 const HAND_SPAN_MM = 85;    // index knuckle to pinky knuckle
-const FACE_WIDTH_MM = 145;  // cheekbone to cheekbone
 // Approximate focal length; cover mapping uses the full drawn video width.
 const FOCAL_FACTOR = .866;
 function distanceMm(realMm: number, apparentPx: number, frameWidth: number) {
@@ -136,60 +179,12 @@ class PointFilters {
   }
   resetFrom(slot: number) { for (let i = slot; i < this.filters.length; i += 1) this.filters[i]?.reset(); }
 }
-const distance = (a: Point, b: Point) => Math.hypot(a.x - b.x, a.y - b.y);
-
-function palmCenter(hand: Point[]) {
-  const ids = [0, 5, 9, 13, 17];
-  return ids.reduce((center, id) => {
-    center.x += hand[id].x / ids.length;
-    center.y += hand[id].y / ids.length;
-    return center;
-  }, { x: 0, y: 0 });
-}
-
-/**
- * Palm plane from the wrist and the two outer knuckles. The normal is only ever
- * used through its absolute alignment with the palm-to-palm axis, so the
- * handedness sign convention cannot invert the result: a palm turned edge-on
- * reads zero either way.
- */
-function palmNormal(hand: Point[]) {
-  const w = hand[0];
-  const a = { x: hand[5].x - w.x, y: hand[5].y - w.y, z: (hand[5].z ?? 0) - (w.z ?? 0) };
-  const b = { x: hand[17].x - w.x, y: hand[17].y - w.y, z: (hand[17].z ?? 0) - (w.z ?? 0) };
-  const n = {
-    x: a.y * b.z - a.z * b.y,
-    y: a.z * b.x - a.x * b.z,
-    z: a.x * b.y - a.y * b.x,
-  };
-  const length = Math.hypot(n.x, n.y, n.z) || 1;
-  return { x: n.x / length, y: n.y / length, z: n.z / length };
-}
-
-function palmDepth(hand: Point[]) {
-  return PALM_IDS.reduce((sum, id) => sum + (hand[id].z ?? 0), 0) / PALM_IDS.length;
-}
-
-// Landmarks that bound the head and give it an orientation.
-const FACE_TOP = 10;
-const FACE_CHIN = 152;
-const FACE_LEFT = 234;
-const FACE_RIGHT = 454;
-const FACE_NOSE = 1;
-
-function normalise(v: { x: number; y: number; z: number }) {
-  const length = Math.hypot(v.x, v.y, v.z) || 1;
-  return { x: v.x / length, y: v.y / length, z: v.z / length };
-}
-
-function cross(a: { x: number; y: number; z: number }, b: { x: number; y: number; z: number }) {
-  return { x: a.y * b.z - a.z * b.y, y: a.z * b.x - a.x * b.z, z: a.x * b.y - a.y * b.x };
-}
 
 export async function createHandTracker(
   video: HTMLVideoElement,
   canvas: HTMLCanvasElement,
   onUpdate: (update: TrackingUpdate) => void,
+  quality: QualityController,
 ): Promise<HandTracker> {
   const { FaceLandmarker, FilesetResolver, HandLandmarker } = await import('@mediapipe/tasks-vision');
   const vision = await FilesetResolver.forVisionTasks(
@@ -219,20 +214,31 @@ export async function createHandTracker(
   }
 
   // The face model is optional: if it will not load, hands still work and the
-  // head simply falls back to relief inferred from the camera image.
+  // head simply stays out of the depth buffer, which is the old behaviour.
   let faceLandmarker: Awaited<ReturnType<typeof FaceLandmarker.createFromOptions>> | null = null;
-  try {
-    faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
-      baseOptions: {
-        modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
-        delegate: 'GPU' as const,
-      },
-      runningMode: 'VIDEO' as const,
-      numFaces: 1,
-    });
-  } catch {
-    faceLandmarker = null;
+  let faceTriangles: Uint16Array | null = null;
+  if (quality.profile.faceMesh) {
+    try {
+      faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+          delegate: 'GPU' as const,
+        },
+        runningMode: 'VIDEO' as const,
+        numFaces: 1,
+        // Procrustes fit of the canonical face model, in centimetres. It gives
+        // a head distance that head yaw does not corrupt, unlike apparent
+        // cheek width, which shortens as soon as you turn.
+        outputFacialTransformationMatrixes: true,
+      });
+      faceTriangles = trianglesFromTesselation(FaceLandmarker.FACE_LANDMARKS_TESSELATION);
+      if (faceTriangles.length < 300) faceTriangles = null;
+    } catch {
+      faceLandmarker = null;
+      faceTriangles = null;
+    }
   }
+  if (!faceLandmarker) quality.disable('faceMesh');
 
   const drawingContext = canvas.getContext('2d');
   if (!drawingContext) throw new Error('2D canvas is unavailable');
@@ -241,21 +247,58 @@ export async function createHandTracker(
   let destroyed = false;
   let animationFrame = 0;
   let lastVideoTime = -1;
-  let faceFrame = 0;
-  let lastFace: Point[] | null = null;
+  let faceFrameCounter = 0;
+  let lastFaceLandmarks: Point[] | null = null;
+  let lastFaceMatrix: { data: number[] } | undefined;
   let smoothedConfinement = 0.08;
   const control = { left: new Vector2(), right: new Vector2() };
   let controlsReady = false;
   let debug = false;
+  let guideVisible = true;
+  const guide = createGuideLine();
 
-  // Person segmentation is also optional, and it loads without blocking: hands
-  // and the field start immediately, and the silhouette joins the compositor
+  // Person segmentation is optional, and it loads without blocking: hands and
+  // the field start immediately, and the silhouette joins the compositor
   // whenever the model arrives.
   let segmenter: PersonSegmenter | null = null;
   let personMask: PersonMask | null = null;
-  void createPersonSegmenter(vision)
-    .then((created) => { if (destroyed) created?.destroy(); else segmenter = created; })
-    .catch(() => { segmenter = null; });
+  if (quality.profile.segmentation) {
+    void createPersonSegmenter(vision, quality.profile.multiclassSegmentation)
+      .then((created) => {
+        if (destroyed) created?.destroy();
+        else if (created) segmenter = created;
+        else quality.disable('segmentation');
+      })
+      .catch(() => { segmenter = null; quality.disable('segmentation'); });
+  }
+
+  // Dense depth is the last thing to arrive and the first thing to go. It only
+  // ever fills surfaces the rig cannot reach.
+  let depthEstimator: DepthEstimator | null = null;
+  let depthMap: DepthMap | null = null;
+  let depthFit: AffineFit | null = null;
+  const depthSamples: DepthSample[] = [];
+  if (quality.profile.denseDepth) {
+    void createDepthEstimator()
+      .then((created) => {
+        if (destroyed) created?.destroy();
+        else if (created) depthEstimator = created;
+        else quality.disable('denseDepth');
+      })
+      .catch(() => quality.disable('denseDepth'));
+  }
+  quality.subscribe((profile) => {
+    if (!profile.denseDepth && depthEstimator) {
+      depthEstimator.destroy();
+      depthEstimator = null;
+      depthMap = null;
+    }
+    if (!profile.segmentation && segmenter) {
+      segmenter.destroy();
+      segmenter = null;
+      personMask = null;
+    }
+  });
 
   // State machine memory.
   const machine = createFieldStateMachine();
@@ -266,15 +309,32 @@ export async function createHandTracker(
   let heldDepths = [.5, .5];
   let previousCenters: Vector2[] = [];
   let previousRig: RigPoint[][] = [];
+  let previousPalms: PalmFrame[] = [];
+  let previousScales: number[] = [];
   let seal = 0;
   let pulse = 0;
   let smoothedFacing = 0;
   let smoothedDepth = .5;
   let lastGapRatio = 99;
+  let smoothedConfidence = 0;
+  // The block is placed once and then followed. It belongs to one hand at a
+  // time and holds its position when that hand is gone.
+  const calloutPos = new Vector2();
+  const calloutTarget = new Vector2();
+  let calloutSide: 'left' | 'right' = 'right';
+  let calloutPlaced = false;
+  /** Which palm the block is locked to; -1 when nothing is tracked. */
+  let anchorSlot = -1;
+  // Held between tracked frames so the overlay can repaint at display rate.
+  let guideAnchor: { x: number; y: number } | null = null;
+  let guideTarget: { x: number; y: number } | null = null;
+  let overlayHands: Point[][] = [];
+  let overlayMode: 'palms' | 'pinch' | 'none' = 'none';
   // Control points can be smoothed harder than the rig, which has to stay
   // glued to the fingers it is masking.
   const controlFilters = new PointFilters(1.1, .009);
   const rigFilters = new PointFilters(2.4, .022);
+  let faceVertexScratch: Float32Array | undefined;
 
   function resize() {
     const width = canvas.clientWidth || window.innerWidth;
@@ -299,8 +359,23 @@ export async function createHandTracker(
     return new Vector2((1 - point.x) * drawnWidth + offsetX, point.y * drawnHeight + offsetY);
   }
 
-  function drawHands(hands: Point[][], width: number, height: number, mode: 'palms' | 'pinch' | 'none') {
+  /**
+   * Redrawn every animation frame rather than only on frames that carried new
+   * landmarks. The models deliver at about half the display rate, so a mark
+   * drawn only when they do steps visibly however well the underlying signal is
+   * filtered; advancing the follower and repainting at display rate is what
+   * makes it read as smooth.
+   */
+  function renderOverlay(now: number) {
+    const width = canvas.clientWidth || window.innerWidth;
+    const height = canvas.clientHeight || window.innerHeight;
+    guide.update(guideAnchor, guideTarget, smoothedConfidence, now);
+    drawOverlay(overlayHands, width, height, overlayMode);
+  }
+
+  function drawOverlay(hands: Point[][], width: number, height: number, mode: 'palms' | 'pinch' | 'none') {
     ctx.clearRect(0, 0, width, height);
+    if (guideVisible) guide.draw(ctx, 1);
     if (!debug) return;
     ctx.lineCap = 'round';
 
@@ -345,66 +420,56 @@ export async function createHandTracker(
   }
 
   /**
-   * Fit an oriented ellipsoid to the face. Orientation comes straight from the
-   * landmarks -- cheek to cheek across, chin to brow up -- the same trick used
-   * for the palm plane, so no pose matrix has to be decoded.
+   * Fold the newest depth map onto the rig's own scale. Depth Anything is
+   * trained scale- and shift-invariant, so its output has the right ordering
+   * and arbitrary units; the hands and face supply the references that turn it
+   * into a distance. A fit that fails leaves the previous transform in place.
    */
-  function buildFace(landmarks: Point[] | null, width: number, height: number): FaceProxy | null {
-    if (!landmarks || landmarks.length < 468) return null;
-    const top = toScreen(landmarks[FACE_TOP], width, height);
-    const chin = toScreen(landmarks[FACE_CHIN], width, height);
-    const left = toScreen(landmarks[FACE_LEFT], width, height);
-    const rightSide = toScreen(landmarks[FACE_RIGHT], width, height);
-    const nose = toScreen(landmarks[FACE_NOSE], width, height);
+  function alignDepth(rawHands: Point[][], rig: RigPoint[][], face: FaceFrame | null, faceLandmarks: Point[] | null) {
+    const estimator = depthEstimator;
+    if (!estimator) return;
+    const raw = estimator.take();
+    if (!raw) return;
 
-    const center = {
-      x: (top.x + chin.x + left.x + rightSide.x) / 4,
-      y: (top.y + chin.y + left.y + rightSide.y) / 4,
-    };
-    const radiusY = Math.max(Math.hypot(top.x - chin.x, top.y - chin.y) / 2, 8) * 1.04;
-    const radiusX = Math.max(Math.hypot(rightSide.x - left.x, rightSide.y - left.y) / 2, 8) * 1.08;
+    depthSamples.length = 0;
+    for (let handIndex = 0; handIndex < rig.length; handIndex += 1) {
+      const source = rawHands[handIndex];
+      const filtered = rig[handIndex];
+      if (!source || !filtered) continue;
+      for (let i = 0; i < filtered.length; i += 1) {
+        depthSamples.push({ u: source[i].x, v: source[i].y, near: filtered[i].z });
+      }
+    }
+    if (face && faceLandmarks) {
+      // Every twelfth landmark: enough of the head to pin the fit without
+      // letting the face outvote the hands.
+      for (let i = 0; i < face.count; i += 12) {
+        depthSamples.push({ u: faceLandmarks[i].x, v: faceLandmarks[i].y, near: face.vertices[i * 3 + 2] });
+      }
+    }
 
-    // Basis in screen space, with the model's own z for the depth axis.
-    const across = normalise({
-      x: rightSide.x - left.x,
-      y: rightSide.y - left.y,
-      z: ((landmarks[FACE_RIGHT].z ?? 0) - (landmarks[FACE_LEFT].z ?? 0)) * width,
-    });
-    let up = normalise({
-      x: top.x - chin.x,
-      y: top.y - chin.y,
-      z: ((landmarks[FACE_TOP].z ?? 0) - (landmarks[FACE_CHIN].z ?? 0)) * width,
-    });
-    const forward = normalise(cross(across, up));
-    // Re-orthogonalise so the basis is clean even when the landmarks are not.
-    up = normalise(cross(forward, across));
+    const fit = fitAffine(raw, depthSamples);
+    if (fit) depthFit = fit;
+    if (!depthFit) return;
 
-    // Same apparent-size measure the hands use, so the head lands at a distance
-    // that is directly comparable with them: lean back and it dims.
-    const frameWidth = (video.videoWidth || 1280) * Math.max(width / (video.videoWidth || 1280), height / (video.videoHeight || 720));
-    const faceMm = distanceMm(FACE_WIDTH_MM, radiusX * 2, frameWidth);
-    const depth = nearnessFromDistance(faceMm);
-
-    return {
-      center,
-      radiusX,
-      radiusY,
-      radiusZ: radiusX * .92,
-      basis: [across.x, across.y, across.z, up.x, up.y, up.z, forward.x, forward.y, forward.z],
-      depth,
-      // The nose reaches toward the camera by roughly its own radius.
-      nose: { x: nose.x, y: nose.y, z: nearnessFromDistance(faceMm - 55), radius: radiusX * .3 },
-    };
+    const pixels = raw.width * raw.height;
+    if (!depthMap || depthMap.width !== raw.width || depthMap.height !== raw.height) {
+      depthMap = { data: new Uint8Array(pixels), width: raw.width, height: raw.height, version: 0 };
+    }
+    applyFit(raw, depthFit, depthMap.data);
+    depthMap.version += 1;
   }
 
-  function updateControl(hands: Point[][], face: Point[] | null, width: number, height: number) {
+  function updateControl(rawHands: Point[][], faceLandmarks: Point[] | null, width: number, height: number) {
     const frameTime = performance.now();
     const dt = Math.min((frameTime - lastFrameTime) / 1000 || 1 / 30, .1);
     lastFrameTime = frameTime;
     const ease = (tau: number) => 1 - Math.exp(-dt / tau);
+
     // Assign detections to previous screen positions before filtering. Detector
     // output order can change when hands cross or occlude one another.
-    const centers = hands.map(hand => toScreen(palmCenter(hand), width, height));
+    let hands = rawHands;
+    const centers = hands.map(hand => toScreen(hand[9], width, height));
     if (hands.length === 2 && previousCenters.length === 2) {
       const direct = centers[0].distanceTo(previousCenters[0]) + centers[1].distanceTo(previousCenters[1]);
       const swapped = centers[1].distanceTo(previousCenters[0]) + centers[0].distanceTo(previousCenters[1]);
@@ -412,6 +477,7 @@ export async function createHandTracker(
     }
     if (hands.length !== previousCenters.length) rigFilters.resetFrom(0);
     previousCenters = centers;
+
     const videoWidth = video.videoWidth || 1280;
     const videoHeight = video.videoHeight || 720;
     const drawnWidth = videoWidth * Math.max(width / videoWidth, height / videoHeight);
@@ -422,6 +488,37 @@ export async function createHandTracker(
         (hand[5].z ?? 0) - (hand[17].z ?? 0));
       return distanceMm(HAND_SPAN_MM, span * drawnWidth, drawnWidth);
     });
+
+    // --- Rig first, so every gesture measure below reads the same filtered
+    // geometry the renderer will mask and light with.
+    let slot = 0;
+    let rig = hands.map((hand, handIndex) => {
+      const handMm = handDistances[handIndex];
+      const width3d = Math.max(Math.hypot(hand[5].x - hand[17].x,
+        (hand[5].y - hand[17].y) * videoHeight / videoWidth,
+        (hand[5].z ?? 0) - (hand[17].z ?? 0)), .01);
+      const localOrigin = hand.reduce((sum, p, i) => PALM_IDS.includes(i) ? sum + (p.z ?? 0) / PALM_IDS.length : sum, 0);
+      return hand.map((point) => {
+        const screen = toScreen(point, width, height);
+        // Landmark z is relative within the hand; spread it over a plausible
+        // depth for a hand rather than over the whole scene.
+        const localMm = ((point.z ?? 0) - localOrigin) / width3d * HAND_SPAN_MM;
+        return {
+          x: rigFilters.at(slot++).filter(screen.x, frameTime),
+          y: rigFilters.at(slot++).filter(screen.y, frameTime),
+          z: rigFilters.at(slot++).filter(nearnessFromDistance(handMm + localMm), frameTime),
+        };
+      });
+    });
+    // Stale filters belong to a hand that has left; drop their history so a
+    // returning hand does not slide in from where the last one was.
+    rigFilters.resetFrom(slot);
+
+    // Screen pixels per unit of nearness, per hand: the factor that puts the
+    // palm's z into the same units as its x and y so the normal is real.
+    const handScale = handDistances.map(mm => NEARNESS_SPAN_MM * FOCAL_FACTOR * drawnWidth / Math.max(mm, 1));
+    let palms = rig.map((hand, index) => buildPalmFrame(hand, handScale[index] ?? 0));
+
     let targetConfinement = 0.08;
     let presence = 0;
     let label = 'Show one or two hands';
@@ -429,60 +526,89 @@ export async function createHandTracker(
     let targetLeft = new Vector2(width * 0.42, height * 0.5);
     let targetRight = new Vector2(width * 0.58, height * 0.5);
     let facing = 0;
+    let evidence = 0;
+    let confidence = 0;
 
-    const depths = hands.map(palmDepth);
-    if (hands.length >= 2) {
-      const centerA = palmCenter(hands[0]);
-      const centerB = palmCenter(hands[1]);
-      const screenA = toScreen(centerA, width, height);
-      const screenB = toScreen(centerB, width, height);
+    if (palms.length >= 2) {
+      const [a, b] = palms;
+      const screenA = new Vector2(a.center.x, a.center.y);
+      const screenB = new Vector2(b.center.x, b.center.y);
       const gap = screenA.distanceTo(screenB);
 
       // Palm size sets the scale for everything: a clasp is a gap comparable to
       // the palms themselves, not a fixed number of pixels.
-      const sizeA = Math.max(toScreen(hands[0][0], width, height).distanceTo(toScreen(hands[0][9], width, height)), toScreen(hands[0][5], width, height).distanceTo(toScreen(hands[0][17], width, height)));
-      const sizeB = Math.max(toScreen(hands[1][0], width, height).distanceTo(toScreen(hands[1][9], width, height)), toScreen(hands[1][5], width, height).distanceTo(toScreen(hands[1][17], width, height)));
-      const palmSize = Math.max((sizeA + sizeB) / 2, 1e-3);
+      const palmSize = Math.max((a.radius + b.radius) / 2, 1e-3);
       lastGapRatio = gap / palmSize;
 
-      const axis = { x: centerB.x - centerA.x, y: centerB.y - centerA.y, z: (depths[1] - depths[0]) };
+      // Facing, from the real palm normals against the palm-to-palm axis in the
+      // same metric space. Absolute alignment, so edge-on reads 0 whichever way
+      // a normal happens to point.
+      const scale = (handScale[0] + handScale[1]) / 2;
+      const axis = { x: b.center.x - a.center.x, y: b.center.y - a.center.y, z: (b.center.z - a.center.z) * scale };
       const axisLength = Math.hypot(axis.x, axis.y, axis.z) || 1;
       const unit = { x: axis.x / axisLength, y: axis.y / axisLength, z: axis.z / axisLength };
-      const nA = palmNormal(hands[0]);
-      const nB = palmNormal(hands[1]);
-      // Absolute alignment: edge-on palms read 0 whichever way the normal points.
-      facing = (Math.abs(nA.x * unit.x + nA.y * unit.y + nA.z * unit.z)
-        + Math.abs(nB.x * unit.x + nB.y * unit.y + nB.z * unit.z)) / 2;
+      facing = (Math.abs(a.normal.x * unit.x + a.normal.y * unit.y + a.normal.z * unit.z)
+        + Math.abs(b.normal.x * unit.x + b.normal.y * unit.y + b.normal.z * unit.z)) / 2;
 
-      targetConfinement = 1 - clamp01((lastGapRatio - 1.05) / 5.5);
+      // Extra clasp evidence. Overlapping in projection is not interlocking:
+      // the palms have to be at a comparable distance, their silhouettes have
+      // to be collapsing, and fingertips crossing into the other outline are
+      // the strongest single sign that the hands have actually closed.
+      const depthGapMm = Math.abs(a.center.z - b.center.z) * NEARNESS_SPAN_MM;
+      const depthAgreement = 1 - clamp01((depthGapMm - 40) / 90);
+      const collapse = 1 - clamp01(((a.openness + b.openness) / 2 - .34) / .34);
+      let crossings = 0;
+      for (const tip of FINGERTIPS) {
+        if (containsPoint(b, rig[0][tip].x, rig[0][tip].y)) crossings += 1;
+        if (containsPoint(a, rig[1][tip].x, rig[1][tip].y)) crossings += 1;
+      }
+      const containment = crossings / FINGERTIPS.length / 2;
+      evidence = (containment * .55 + collapse * .3) * depthAgreement - (1 - depthAgreement) * .8;
+
+      // The dial spans the whole gesture, from palms at their widest down to
+      // a clasp, so it starts responding the instant the hands begin closing
+      // rather than waiting for them to get near each other. Two palms held
+      // out are five or six palm-widths apart; the range below covers that.
+      //
+      // It is deliberately linear in the gap. The acceleration the eye reads
+      // comes from E/E0 = (L0/L)^2, which is the physics, not from bending
+      // this curve.
+      targetConfinement = 1 - clamp01((lastGapRatio - 1.0) / 4.6);
       presence = 1;
-      // Keep identities through crossings; never exchange endpoint histories.
       [targetLeft, targetRight] = [screenA, screenB];
       label = 'Two palms';
       mode = 'palms';
-    } else if (hands.length === 1) {
-      const hand = hands[0];
-      const pinchDistance = distance(hand[4], hand[8]);
-      const palmWidth = Math.max(distance(hand[5], hand[17]), 0.035);
+      confidence = clamp01(.45 + (a.openness + b.openness) * .35);
+    } else if (palms.length === 1) {
+      const hand = rig[0];
+      const palm = palms[0];
+      const pinchDistance = Math.hypot(hand[4].x - hand[8].x, hand[4].y - hand[8].y);
+      const palmWidth = Math.max(Math.hypot(hand[5].x - hand[17].x, hand[5].y - hand[17].y), 1);
       const pinchRatio = pinchDistance / palmWidth;
-      targetConfinement = 1 - clamp01((pinchRatio - 0.16) / 0.92);
+      targetConfinement = 1 - clamp01((pinchRatio - 0.14) / 0.62);
       presence = 1;
-      targetLeft = toScreen(hand[4], width, height);
-      targetRight = toScreen(hand[8], width, height);
+      targetLeft = new Vector2(hand[4].x, hand[4].y);
+      targetRight = new Vector2(hand[8].x, hand[8].y);
       if (targetLeft.x > targetRight.x) [targetLeft, targetRight] = [targetRight, targetLeft];
-      const n = palmNormal(hand);
-      facing = clamp01(1 - Math.abs(n.z) * .6);
+      facing = clamp01(1 - Math.abs(palm.normal.z) * .6);
       label = 'One hand · pinch';
       mode = 'pinch';
-
+      confidence = clamp01(.4 + palm.openness * .5);
       lastGapRatio = 99;
     } else {
       lastGapRatio = 99;
     }
 
-    const nearClasp = hands.length === 1 && toScreen(palmCenter(hands[0]), width, height).distanceTo(claspCenter) < claspRadius * 1.8;
-    const transition = machine.update({ now: frameTime, hands: hands.length,
-      gapRatio: lastGapRatio, confinement: targetConfinement, nearClasp });
+    const nearClasp = palms.length === 1
+      && new Vector2(palms[0].center.x, palms[0].center.y).distanceTo(claspCenter) < claspRadius * 1.8;
+    const transition = machine.update({
+      now: frameTime,
+      hands: hands.length,
+      gapRatio: lastGapRatio,
+      confinement: targetConfinement,
+      nearClasp,
+      evidence,
+    });
     state = transition.state;
     seal = transition.seal;
     pulse = transition.pulse;
@@ -493,7 +619,7 @@ export async function createHandTracker(
     if (transition.holdAnchors) {
       // Move the compact knot with the remaining palm, never switch its ends
       // to thumb and index while a clasp is temporarily hidden.
-      const nextCenter = hands.length ? toScreen(palmCenter(hands[0]), width, height) : claspCenter;
+      const nextCenter = palms.length ? new Vector2(palms[0].center.x, palms[0].center.y) : claspCenter;
       const shift = nextCenter.clone().sub(claspCenter).multiplyScalar(.25);
       targetLeft.copy(control.left).add(shift);
       targetRight.copy(control.right).add(shift);
@@ -501,6 +627,20 @@ export async function createHandTracker(
       targetConfinement = 1;
       mode = 'palms';
       presence = hands.length ? 1 : .55;
+      confidence = Math.min(confidence, .45);
+    }
+
+    // A clasp briefly losing both hands keeps its last geometry rather than
+    // dropping the surfaces it was lighting. The palms have to be held with the
+    // rig: restoring one without the other leaves the renderer masking fingers
+    // that have no surface to emit from.
+    if (transition.holdAnchors && hands.length === 0) {
+      rig = previousRig;
+      palms = previousPalms;
+    } else if (rig.length) {
+      previousRig = rig;
+      previousPalms = palms;
+      previousScales = handScale;
     }
 
     if (mode === 'none') {
@@ -526,57 +666,32 @@ export async function createHandTracker(
       );
     }
 
-    smoothedConfinement += (targetConfinement - smoothedConfinement) * ease(.1);
+    smoothedConfinement += (targetConfinement - smoothedConfinement) * ease(.055);
     smoothedFacing += (facing - smoothedFacing) * ease(.12);
+    smoothedConfidence += (confidence - smoothedConfidence) * ease(.2);
 
     const labels: Record<FieldState, string> = {
       dormant: 'Show one or two hands',
       open: `${label} · open`,
       compressing: `${label} · compressing`,
+      critical: `${label} · near collapse`,
       clasped: 'Sealed',
       release: `${label} · releasing`,
     };
 
-    drawHands(hands, width, height, mode);
-    const proxy = buildFace(face, width, height);
-
-    // Hands live in the near part of the depth range so the head proxy can sit
-    // behind them; within that band their own z spread is preserved.
-    let slot = 0;
-    let rig = hands.map((hand, handIndex) => {
-      const handMm = handDistances[handIndex];
-      const width3d = Math.max(Math.hypot(hand[5].x - hand[17].x,
-        (hand[5].y - hand[17].y) * videoHeight / videoWidth,
-        (hand[5].z ?? 0) - (hand[17].z ?? 0)), .01);
-      const localOrigin = palmDepth(hand);
-      return hand.map((point) => {
-        const screen = toScreen(point, width, height);
-        // Landmark z is relative within the hand; spread it over a plausible
-        // depth for a hand rather than over the whole scene.
-        const localMm = ((point.z ?? 0) - localOrigin) / width3d * HAND_SPAN_MM;
-        return {
-          x: rigFilters.at(slot++).filter(screen.x, frameTime),
-          y: rigFilters.at(slot++).filter(screen.y, frameTime),
-          z: rigFilters.at(slot++).filter(nearnessFromDistance(handMm + localMm), frameTime),
-        };
-      });
-    });
-    // Stale filters belong to a hand that has left; drop their history so a
-    // returning hand does not slide in from where the last one was.
-    rigFilters.resetFrom(slot);
-
-    if (transition.holdAnchors && hands.length === 0) rig = previousRig;
-    else previousRig = rig;
-    const palms = rig.map(buildPalmFrame);
-    // Use the very same filtered landmarks for the surface and its anchor.
-    if (!transition.holdAnchors && palms.length === 2) {
-      control.left.set(palms[0].center.x, palms[0].center.y);
-      control.right.set(palms[1].center.x, palms[1].center.y);
-    } else if (mode === 'pinch' && rig[0]) {
-      const ordered = [rig[0][4], rig[0][8]].sort((a, b) => a.x - b.x);
-      control.left.set(ordered[0].x, ordered[0].y);
-      control.right.set(ordered[1].x, ordered[1].y);
+    // The head, as a surface rather than an ellipsoid.
+    let face: FaceFrame | null = null;
+    if (faceLandmarks && quality.profile.faceMesh) {
+      faceVertexScratch = faceVertexScratch ?? new Float32Array(478 * 3);
+      face = buildFaceFrame(
+        faceLandmarks,
+        lastFaceMatrix,
+        (point) => toScreen(point, width, height),
+        (realMm, apparentPx) => distanceMm(realMm, apparentPx, drawnWidth),
+        faceVertexScratch,
+      );
     }
+
     let leftDepth = palms[0]?.center.z ?? heldDepths[0];
     let rightDepth = palms[1]?.center.z ?? leftDepth;
     if (mode === 'pinch' && rig[0]) {
@@ -587,6 +702,62 @@ export async function createHandTracker(
     else heldDepths = [leftDepth, rightDepth];
     const normalisedPlane = fieldDepthFromEndpoints({ x: 0, y: 0, z: leftDepth }, { x: 0, y: 0, z: rightDepth });
     smoothedDepth += (normalisedPlane - smoothedDepth) * ease(.1);
+
+    // One hand, and it stays that hand. The block picks the more open palm when
+    // it first acquires and then holds that slot for as long as the slot
+    // exists, so two visible hands never cause it to hop between them. The
+    // detector's own ordering is already stabilised against the previous frame
+    // above, so the slot keeps its identity through crossings.
+    if (anchorSlot < 0 || anchorSlot >= palms.length) {
+      anchorSlot = palms.length
+        ? (palms.length === 2 && palms[1].openness > palms[0].openness ? 1 : 0)
+        : -1;
+    }
+    const anchorPalm = anchorSlot >= 0 ? palms[anchorSlot] : undefined;
+    const anchor = anchorPalm ? { x: anchorPalm.center.x, y: anchorPalm.center.y } : null;
+
+    if (anchor) {
+      // Which side has room, with a wide band before it will change its mind.
+      const limit = width - CALLOUT_WIDTH - CALLOUT_PAD;
+      if (calloutSide === 'right' && anchor.x + CALLOUT_GAP > limit) calloutSide = 'left';
+      else if (calloutSide === 'left' && anchor.x + CALLOUT_GAP < limit - CALLOUT_SWITCH_HYSTERESIS) {
+        calloutSide = 'right';
+      }
+      const preferred = calloutSide === 'right'
+        ? anchor.x + CALLOUT_GAP
+        : anchor.x - CALLOUT_GAP - CALLOUT_WIDTH;
+      calloutTarget.set(
+        Math.max(CALLOUT_PAD, Math.min(limit, preferred)),
+        Math.max(CALLOUT_PAD, Math.min(height - CALLOUT_HEIGHT - CALLOUT_PAD, anchor.y - CALLOUT_HEIGHT * .3)),
+      );
+    } else if (!calloutPlaced) {
+      // Nothing has been tracked yet: rest at the left of the frame, and glide
+      // out to the hand when one arrives.
+      calloutTarget.set(CALLOUT_PAD + 18, Math.max(CALLOUT_PAD, height * .5 - CALLOUT_HEIGHT * .5));
+    } else {
+      // The hands have gone. Hold position rather than snapping anywhere.
+      calloutTarget.copy(calloutPos);
+    }
+
+    if (!calloutPlaced) {
+      calloutPos.copy(calloutTarget);
+      calloutPlaced = true;
+    } else {
+      calloutPos.lerp(calloutTarget, ease(CALLOUT_TAU));
+    }
+    const callout = { x: calloutPos.x, y: calloutPos.y, side: calloutSide };
+
+    // The leader is only drawn when there is a hand to point at; the text
+    // itself never leaves. Both ends are handed to the overlay, which advances
+    // and repaints them at display rate.
+    guideAnchor = anchor;
+    guideTarget = anchor
+      ? { x: calloutSide === 'right' ? calloutPos.x - 2 : calloutPos.x + CALLOUT_WIDTH + 2, y: calloutPos.y + 30 }
+      : null;
+
+    alignDepth(hands, rig, face, faceLandmarks);
+    overlayHands = hands;
+    overlayMode = mode;
 
     onUpdate({
       confinement: smoothedConfinement,
@@ -603,12 +774,17 @@ export async function createHandTracker(
       fieldDepth: smoothedDepth,
       leftDepth, rightDepth, palms,
       rig,
-      face: proxy,
+      handScale: rig === previousRig && !hands.length ? previousScales : handScale,
+      face,
+      faceTriangles,
       person: personMask,
+      depth: depthMap,
       // Without a head there is no measured distance for a body, so the
       // silhouette is parked behind the scene: it can still catch rim light,
       // but it never wrongly swallows the field.
-      bodyDepth: proxy ? Math.max(proxy.depth - .035, 0) : .1,
+      bodyDepth: face ? Math.max(face.depth - .035, 0) : .1,
+      confidence: smoothedConfidence,
+      callout,
     });
   }
 
@@ -620,24 +796,27 @@ export async function createHandTracker(
       const stamp = performance.now();
       const result = handLandmarker.detectForVideo(video, stamp);
       let face: Point[] | null = null;
-      if (faceLandmarker) {
+      if (faceLandmarker && quality.profile.faceMesh) {
         try {
           // Face geometry changes far slower than hands, so it is sampled at
           // half rate to keep two models inside the frame budget.
-          faceFrame = (faceFrame + 1) % 2;
-          if (faceFrame === 0) {
+          faceFrameCounter = (faceFrameCounter + 1) % 2;
+          if (faceFrameCounter === 0) {
             const faceResult = faceLandmarker.detectForVideo(video, stamp);
-            lastFace = (faceResult.faceLandmarks?.[0] as Point[] | undefined) ?? null;
+            lastFaceLandmarks = (faceResult.faceLandmarks?.[0] as Point[] | undefined) ?? null;
+            lastFaceMatrix = faceResult.facialTransformationMatrixes?.[0];
           }
-          face = lastFace;
+          face = lastFaceLandmarks;
         } catch {
           face = null;
         }
       }
       // The silhouette is sampled from the same frame the landmarks came from.
       if (segmenter) personMask = segmenter.update(video, video.videoWidth, video.videoHeight, stamp) ?? personMask;
+      depthEstimator?.submit(video, stamp);
       updateControl(result.landmarks as Point[][], face, width, height);
     }
+    renderOverlay(performance.now());
     animationFrame = requestAnimationFrame(predict);
   }
 
@@ -649,6 +828,10 @@ export async function createHandTracker(
       debug = enabled;
       if (!debug) ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
     },
+    setGuide(enabled) {
+      guideVisible = enabled;
+      if (!enabled) guide.reset();
+    },
     destroy() {
       destroyed = true;
       cancelAnimationFrame(animationFrame);
@@ -658,6 +841,8 @@ export async function createHandTracker(
       faceLandmarker?.close();
       segmenter?.destroy();
       segmenter = null;
+      depthEstimator?.destroy();
+      depthEstimator = null;
     },
   };
 }

@@ -1,24 +1,59 @@
 @import 'tailwindcss';
 
+/* Alte Haas Grotesk, Yann Le Coroller, 2007. Freeware, redistributable only
+   together with its licence text, which ships beside the files at
+   public/fonts/alte-haas-grotesk/LICENSE.txt. Self-hosted because the font is
+   not on any webfont service; the .ttf files from the author's distribution
+   were converted to woff2 and are otherwise unmodified. */
+@font-face {
+  font-family: 'Alte Haas Grotesk';
+  src: url('/fonts/alte-haas-grotesk/AlteHaasGroteskRegular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Alte Haas Grotesk';
+  src: url('/fonts/alte-haas-grotesk/AlteHaasGroteskBold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
 :root {
-  --ice: #dcebf6;
-  --silver: #eff3f5;
-  --warm: #f7e5bf;
+  /* Geist Sans and Geist Mono arrive as self-hosted variables from
+     next/font/google. SIL Open Font License 1.1. */
+  --font-display: 'Alte Haas Grotesk', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  --font-body: var(--font-instrument-serif), Georgia, 'Times New Roman', serif;
+  --font-caption: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+
+  --ink: #eef2f5;
+  --ink-2: #a9b3ba;
+  --ink-3: #6f7a81;
+  /* One sequential ramp, low to high, shared by the field and the meters. */
+  --ice: #cfe1f2;
+  --hot: #fff4de;
+  --track: rgba(207, 225, 242, .16);
   --void: #020405;
-  --line: rgba(220, 235, 246, .18);
+  --line: rgba(226, 236, 244, .14);
+  --line-strong: rgba(226, 236, 244, .3);
 }
 
 * { box-sizing: border-box; }
 html, body { margin: 0; min-height: 100%; background: var(--void); }
-body { overflow: hidden; color: var(--silver); font-family: Arial, Helvetica, sans-serif; }
-button { font: inherit; }
+body {
+  overflow: hidden;
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 19px;
+  -webkit-font-smoothing: antialiased;
+}
+button { font: inherit; color: inherit; }
 
 .sr-only {
   position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  margin: -1px;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
   overflow: hidden;
   clip: rect(0, 0, 0, 0);
   white-space: nowrap;
@@ -31,7 +66,12 @@ button { font: inherit; }
   min-width: 320px;
   overflow: hidden;
   isolation: isolate;
-  background: radial-gradient(circle at 50% 48%, #101518 0%, #040708 58%, #010203 100%);
+  background: radial-gradient(circle at 50% 48%, #0d1216 0%, #040709 58%, #010203 100%);
+  /* The interface is set lowercase. It inherits from here rather than being
+     repeated per rule, so there is one place to change it -- and one place to
+     take it back off again, below, where case carries meaning rather than
+     style. */
+  text-transform: lowercase;
 }
 
 .camera-feed,
@@ -43,66 +83,319 @@ button { font: inherit; }
   height: 100%;
 }
 
-.camera-feed {
-  z-index: 0;
-  object-fit: cover;
-  transform: scaleX(-1);
-}
-
+.camera-feed { z-index: 0; object-fit: cover; transform: scaleX(-1); }
 .wave-canvas { z-index: 2; pointer-events: none; }
 .tracking-canvas { z-index: 3; pointer-events: none; }
+
+/* --- Typography ------------------------------------------------------- */
+
+/* Three faces, three jobs. Alte Haas Grotesk Bold titles; Instrument Serif
+   reads; Geist Mono labels the figures. No uppercase anywhere -- the letterforms
+   carry the hierarchy, not the casing. */
+
+.display {
+  font-family: var(--font-display);
+  font-weight: 700;
+  letter-spacing: -.016em;
+  line-height: 1.02;
+  margin: 0;
+}
+.section-head {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 1.375rem;
+  letter-spacing: -.008em;
+  line-height: 1.24;
+  margin: 0;
+}
+.meta {
+  font-family: var(--font-caption);
+  font-size: .875rem;
+  letter-spacing: .04em;
+  color: var(--ink-3);
+}
+/* The symbols and figures are body text too, so they are set in the body face.
+   There is no column of changing digits anywhere in the interface any more --
+   the readouts are meters -- so nothing needs tabular figures, and a monospace
+   was only ever costing a fourth typeface. */
+.numeral { font-family: var(--font-body); }
+
+/* Case is meaning in three places, and lowercasing them would be an error
+   rather than a style:
+     - symbols, where the transform turns delta into small delta and E into e,
+       which are different quantities;
+     - the physics prose, which carries N, K, psi, T and the names of the people
+       who proved the results;
+     - the citations, which are the real titles of real papers.
+   Everything else in the frame stays lowercase. */
+.meter-symbol,
+.reader > header p:not(.meta),
+.reader article p,
+.reader article a { text-transform: none; }
+
+/* --- The hand callout ------------------------------------------------- */
+
+/* Placed by the tracker, which also draws the dot on the palm and the leader
+   into this block. No rules, no border, no panel: the drawn line is the only
+   thing tying the text to the hand. */
+.callout {
+  position: absolute; z-index: 6; left: 0; top: 0;
+  width: 280px;
+  opacity: 0;
+  pointer-events: none;
+  isolation: isolate;
+  /* Opacity is slow because it only ever runs once: the block appears on the
+     first tracked frame and stays for the session. The transform carries a
+     short linear tween so the position interpolates between the tracker's
+     updates, which arrive at about half the display rate; without it the block
+     steps even though the signal underneath is smooth. */
+  transition: opacity 700ms ease, transform 120ms linear;
+  will-change: transform;
+}
+.callout[data-ready='true'] { opacity: 1; }
+.callout[data-side='left'] { text-align: right; }
+
+/* The subject is lit by the field, so the text can find itself over a bright
+   hand as easily as over a dark room. This is a scrim that darkens what is
+   behind the words without ever becoming a panel: `closest-side` puts the
+   gradient's zero exactly on the nearest edge, so it reaches transparent before
+   the box does and never leaves a straight edge anywhere. */
+.callout::before {
+  content: '';
+  position: absolute;
+  inset: -52px -58px;
+  z-index: -1;
+  /* Legibility rests entirely on this now that nothing wears a shadow, so it
+     carries a little more weight -- still reaching transparent before its own
+     edges, so it never becomes a panel. */
+  background: radial-gradient(closest-side at 50% 50%, rgba(2, 5, 7, .8), rgba(2, 5, 7, 0));
+}
+
+.callout-state {
+  margin: 0 0 20px;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 1.5rem;
+  letter-spacing: -.014em;
+  line-height: 1.1;
+  color: var(--ink);
+}
+
+.meters { display: flex; flex-direction: column; gap: 17px; }
+
+/* A meter: one ratio against its own range. Label and units share a line, the
+   track sits under them. The track is a dim step of the same ramp the fill
+   uses, so the whole bar reads as one scale. */
+.meter { display: grid; gap: 8px; }
+.meter-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.meter-label {
+  font-family: var(--font-body);
+  font-size: 1.0625rem;
+  letter-spacing: 0;
+  color: var(--ink);
+}
+.meter-track {
+  position: relative;
+  display: block;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--track);
+  overflow: visible;
+}
+.meter-track i {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--ice);
+  transform-origin: left;
+  transition: transform 220ms cubic-bezier(.3,.7,.3,1), background 400ms ease;
+}
+.callout[data-side='left'] .meter-track i { transform-origin: right; }
+/* The fill carries severity: confinement drives energy and momentum spread up,
+   and the fill steps along the same ramp toward the white the field itself
+   reaches at full confinement. */
+.meter-track i[data-rising='true'] { background: linear-gradient(to right, var(--ice), var(--hot)); }
+.meter-symbol sub { font-size: .68em; vertical-align: -.22em; }
+.meter-symbol {
+  font-family: var(--font-body);
+  font-size: 1.0625rem;
+  letter-spacing: 0;
+  white-space: nowrap;
+  color: var(--ink-2);
+}
+
+/* The uncertainty product does not move, and that is the point. The dim dot at
+   the left end of the axis is the bound the principle sets; the bright one is
+   the ground state, sitting above it and staying there however hard the well is
+   squeezed. Dots rather than ticks: the same mark the tracker puts on the hand,
+   and no vertical strokes anywhere in the interface. */
+.meter[data-fixed='true'] .meter-track u,
+.meter[data-fixed='true'] .meter-track b {
+  position: absolute; top: 50%;
+  width: 4px; height: 4px;
+  margin: -2px 0 0 -2px;
+  border-radius: 50%;
+}
+.meter[data-fixed='true'] .meter-track u { left: 0; background: var(--ink-3); }
+.meter[data-fixed='true'] .meter-track b {
+  background: var(--ink);
+}
+
+/* --- The one standing line -------------------------------------------- */
+
+/* Same scrim treatment, so the one standing line survives a bright frame. */
+.warning::before {
+  content: '';
+  position: absolute;
+  inset: -34px -92px;
+  z-index: -1;
+  background: radial-gradient(closest-side at 50% 50%, rgba(2, 5, 7, .76), rgba(2, 5, 7, 0));
+}
+.warning {
+  position: absolute; z-index: 6;
+  isolation: isolate;
+  left: 50%; bottom: max(30px, env(safe-area-inset-bottom));
+  transition: opacity 420ms ease, left 460ms cubic-bezier(.22,.8,.28,1);
+  transform: translateX(-50%);
+  margin: 0;
+  max-width: min(46ch, calc(100vw - 200px));
+  text-align: center;
+  font-size: 1.125rem;
+  line-height: 1.45;
+  color: var(--ink-2);
+  pointer-events: none;
+}
+
+/* --- Reader ----------------------------------------------------------- */
+
+.reader {
+  position: absolute; z-index: 7;
+  top: 0; right: 0; bottom: 0;
+  width: min(34rem, 94vw);
+  /* Leaves the last paragraph clear of the tool row that floats above it. */
+  padding: max(30px, env(safe-area-inset-top)) 40px 96px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: linear-gradient(to left, rgba(3,6,8,.92) 0%, rgba(3,6,8,.86) 62%, rgba(3,6,8,0) 100%);
+  transform: translateX(100%);
+  opacity: 0;
+  transition: transform 460ms cubic-bezier(.22,.8,.28,1), opacity 300ms ease;
+  pointer-events: none;
+}
+.reader[data-open='true'] { transform: none; opacity: 1; pointer-events: auto; }
+.reader > header { margin: 0 0 34px; }
+.reader > header .display { font-size: 2rem; }
+.reader > header .meta { display: block; }
+.reader > header p { margin: 16px 0 0; font-size: 1.1875rem; line-height: 1.6; color: var(--ink-2); }
+
+.reader article { padding: 26px 0; border-top: 1px solid var(--line); }
+.reader article:first-of-type { border-top: 0; padding-top: 0; }
+.reader .article-head { display: flex; align-items: baseline; gap: 14px; }
+.reader .article-head .numeral { font-size: 1rem; color: var(--ink-3); letter-spacing: .02em; }
+.reader article p {
+  margin: 14px 0 0;
+  font-size: 1.3125rem;
+  line-height: 1.55;
+  color: #cbd4da;
+  max-width: 52ch;
+}
+.reader article a {
+  display: inline-block;
+  margin-top: 18px;
+  font-family: var(--font-caption);
+  font-size: .875rem;
+  line-height: 1.5;
+  color: var(--ink-3);
+  text-decoration: none;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 2px;
+}
+.reader article a:hover { color: var(--ink-2); border-color: var(--line-strong); }
+
+/* --- Camera gate ------------------------------------------------------- */
 
 .camera-gate {
   position: absolute; z-index: 9; inset: 0;
   display: flex; flex-direction: column; align-items: center; justify-content: center;
-  gap: 18px; pointer-events: none;
+  gap: 20px; pointer-events: none; text-align: center; padding: 24px;
 }
+.camera-gate .display { font-size: clamp(2.25rem, 5vw, 3.75rem); }
 .camera-gate button {
-  pointer-events: auto; display: flex; align-items: center; gap: 12px;
-  padding: 14px 20px; border: 1px solid rgba(255,255,255,.22); border-radius: 28px;
-  color: #fff1ee; background: rgba(14,7,10,.64); backdrop-filter: blur(16px);
-  font-size: .875rem; cursor: pointer;
+  pointer-events: auto; display: inline-flex; align-items: center; gap: 11px;
+  margin-top: 6px; padding: 12px 22px;
+  border: 1px solid var(--line-strong); border-radius: 999px;
+  color: var(--ink); background: rgba(8,12,15,.5); backdrop-filter: blur(14px);
+  font-family: var(--font-caption); font-size: 1rem; cursor: pointer;
+  transition: background 200ms ease, border-color 200ms ease;
 }
-.camera-gate button:disabled { opacity: .6; cursor: wait; }
-.camera-gate p { margin: 0; font-size: .875rem; color: #bfb7bd; }
-.gesture-hint {
-  position: absolute; z-index: 6; left: 20px; right: 20px; bottom: 92px;
-  margin: 0; text-align: center; font-size: .875rem; color: #d9cbd0;
-  text-shadow: 0 1px 12px #000;
+.camera-gate button:hover { background: rgba(18,26,32,.72); border-color: rgba(226,236,244,.45); }
+.camera-gate button:disabled { opacity: .55; cursor: wait; }
+.camera-gate p { margin: 0; max-width: 42ch; font-size: 1.1875rem; line-height: 1.6; color: var(--ink-2); }
+
+/* --- Tools ------------------------------------------------------------- */
+
+.tools {
+  position: absolute; z-index: 8;
+  right: max(26px, env(safe-area-inset-right));
+  bottom: max(26px, env(safe-area-inset-bottom));
+  display: flex; align-items: center; gap: 4px;
+  transition: right 460ms cubic-bezier(.22,.8,.28,1);
 }
-.hand-label {
-  position: absolute; z-index: 6; left: 0; top: 0; width: 166px;
-  display: flex; flex-direction: column; gap: 7px; opacity: 0; pointer-events: none;
-  padding: 9px 0 9px 13px; border-left: 1px solid rgba(255,215,208,.45);
-  color: #fce5df; font-size: .875rem; line-height: 1.25;
-  text-shadow: 0 1px 8px #160309, 0 0 18px #160309;
-  transition: transform 95ms linear, opacity 240ms ease, color 240ms ease;
-  will-change: transform;
+/* With the reader open, the tools and the standing line step aside rather than
+   sitting on its text. Both move by half the panel's width, so the line stays
+   centred in what is left of the frame. */
+@media (min-width: 901px) {
+  .reader[data-open='true'] ~ .tools { right: calc(min(34rem, 94vw) + 22px); }
+  .reader[data-open='true'] ~ .warning { left: calc(50% - min(17rem, 47vw)); }
 }
-.hand-action { font-weight: 500; letter-spacing: .015em; }
-.hand-energy { color: #d2c4c8; font-size: .75rem; }
-.hand-energy strong { margin-left: 8px; color: #f5dcd6; font-weight: 500; }
-.energy-line { display: block; width: 100px; height: 2px; background: rgba(255,229,219,.14); }
-.energy-line i { display: block; width: 100%; height: 100%; background: #e98f87; transform-origin: left; transition: transform 180ms ease; }
-.hand-label[data-energy="high"] { color: #fff3e4; border-color: #ffb0a0; }
-.hand-label[data-energy="high"] .energy-line i { background: #ffd1a9; box-shadow: 0 0 12px #ff483b; }
-.film-mode .hand-label { visibility: hidden; }
-.simulator-footer {
-  position: absolute; z-index: 8; bottom: max(18px, env(safe-area-inset-bottom));
-  left: 24px; right: 24px; display: flex; justify-content: space-between; align-items: center;
-  gap: 16px; pointer-events: none;
+.tools button {
+  display: grid; place-items: center;
+  width: 28px; height: 28px;
+  padding: 0; border: 0; border-radius: 6px;
+  background: none;
+  color: var(--ink);
+  opacity: .38;
+  cursor: pointer;
+  transition: opacity 180ms ease, background 180ms ease;
 }
-.simulator-note { color: #d9c9ce; font-size: .75rem; text-shadow: 0 1px 8px #000; }
-.scene-controls { display: flex; gap: 8px; align-items: center; pointer-events: auto; }
-.scene-controls button, .camera-picker {
-  min-height: 40px; min-width: 40px; display: flex; align-items: center; justify-content: center;
-  border: 1px solid rgba(255,255,255,.12); border-radius: 22px; background: rgba(14,7,10,.42);
-  color: #d9c9ce; backdrop-filter: blur(12px); cursor: pointer;
+.tools button:hover { opacity: .96; background: rgba(226,236,244,.08); }
+.tools button[data-active='true'] { opacity: .9; }
+.tools .camera-picker { position: relative; display: grid; place-items: center; width: 28px; height: 28px; color: var(--ink); opacity: .38; transition: opacity 180ms ease; }
+.tools .camera-picker:hover { opacity: .96; }
+.tools .camera-picker select {
+  position: absolute; inset: 0; opacity: 0; cursor: pointer;
+  appearance: none; border: 0; background: transparent;
 }
-.scene-controls button:hover { color: white; background: rgba(55,22,28,.7); }
-.camera-picker { padding: 0 12px; gap: 8px; }
-.camera-picker select { max-width: min(160px, 30vw); background: transparent; color: inherit; border: 0; font-size: .75rem; }
-.camera-picker option { color: #f4e6e4; background: #180b10; }
-button:focus-visible, select:focus-visible { outline: 2px solid #ffc2b4; outline-offset: 4px; }
-@media (max-width: 540px) { .simulator-footer { left: 16px; right: 16px; } }
-@media (prefers-reduced-motion: reduce) { .hand-label, .energy-line i { transition: none; } }
+.tools .camera-picker option { color: var(--ink); background: #0a0f13; }
+
+.film-mode .callout,
+.film-mode .reader,
+.film-mode .warning { opacity: 0; pointer-events: none; }
+/* Film mode keeps the tools, at the threshold of visibility until reached for. */
+.film-mode .tools button,
+.film-mode .tools .camera-picker { opacity: .1; }
+.film-mode .tools button:hover,
+.film-mode .tools .camera-picker:hover { opacity: .85; }
+
+.interface-hidden .callout,
+.interface-hidden .reader,
+.interface-hidden .warning { opacity: 0; pointer-events: none; }
+
+button:focus-visible, select:focus-visible {
+  outline: 1px solid rgba(226,236,244,.75);
+  outline-offset: 3px;
+  opacity: 1;
+}
+
+@media (max-width: 900px) {
+  .reader { width: 100vw; padding-left: 24px; padding-right: 24px; }
+  .warning { max-width: calc(100vw - 120px); font-size: .75rem; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .callout, .meter-track i, .reader, .warning { transition: none; }
+}

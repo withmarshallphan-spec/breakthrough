@@ -1,21 +1,53 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
-import { Camera, Expand, Eye, EyeOff, Video } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { BookOpen, Clapperboard, Eye, EyeOff, Maximize, Minimize, SwitchCamera, Video } from 'lucide-react';
 import type { WaveEngine } from '@/lib/wave-engine';
 import type { FieldState, HandTracker } from '@/lib/hand-tracker';
-import { normalisedEnergy } from '@/lib/quantum';
+import { createQualityController, type QualityProfile } from '@/lib/quality';
+import {
+  energyRatio,
+  GROUND_UNCERTAINTY,
+  momentumRatio,
+  relativeWellWidth,
+} from '@/lib/quantum';
+import { MODEL_CAVEAT, READOUTS, SECTIONS, STATE_NOTES } from '@/lib/science-copy';
 
-const STATE_COPY: Record<FieldState, { action: string; energy: string }> = {
-  dormant: { action: 'Show your palms', energy: '' },
-  open: { action: 'Broad state', energy: 'Low' },
-  compressing: { action: 'Confining', energy: 'Rising' },
-  clasped: { action: 'Compressed', energy: 'High' },
-  release: { action: 'Releasing', energy: 'Falling' },
-};
+/**
+ * Instrument Serif has no U+2080, so a literal subscript zero falls back to
+ * another face and arrives looking like the letter o -- `L / L₀` reads as
+ * `L / Lo`. Splitting on the character and emitting a real `<sub>` keeps the
+ * whole symbol in one typeface and says what it means.
+ */
+function Symbols({ text }: { text: string }) {
+  const parts = text.split('₀');
+  return (
+    <>
+      {parts.map((part, index) => (
+        <span key={`${part}-${index}`}>
+          {part}
+          {index < parts.length - 1 && <sub>0</sub>}
+        </span>
+      ))}
+    </>
+  );
+}
+
+/** Every icon at the same size and hairline weight, so the set reads as one. */
+const ICON = { size: 16, strokeWidth: 1.25 } as const;
+
+/**
+ * The uncertainty meter's axis, in units of hbar. It starts at the bound the
+ * uncertainty principle sets, so the reader can see the ground state sitting
+ * above it -- and see that squeezing never moves it down.
+ */
+const UNCERTAINTY_FLOOR = .5;
+const UNCERTAINTY_CEILING = .75;
+const UNCERTAINTY_MARK =
+  (GROUND_UNCERTAINTY - UNCERTAINTY_FLOOR) / (UNCERTAINTY_CEILING - UNCERTAINTY_FLOOR);
 
 export default function Home() {
-  const labelRef = useRef<HTMLElement>(null);
+  const calloutRef = useRef<HTMLElement>(null);
   const lastTrackingRef = useRef(0);
   const stageRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -25,21 +57,43 @@ export default function Home() {
   const handTrackerRef = useRef<HandTracker | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const lastMeterUpdateRef = useRef(0);
+  // Held in state rather than a ref so it is created once without being read
+  // during render, and so the initial profile can seed the panel below.
+  const [quality] = useState(createQualityController);
+
   const [cameraState, setCameraState] = useState<'idle' | 'starting' | 'live' | 'error'>('idle');
   const [trackingLabel, setTrackingLabel] = useState('Camera ready');
   const [confinement, setConfinement] = useState(0);
   const [fieldState, setFieldState] = useState<FieldState>('dormant');
   const [hands, setHands] = useState(0);
   const [filmMode, setFilmMode] = useState(false);
+  const [interfaceHidden, setInterfaceHidden] = useState(false);
+  const [readerOpen, setReaderOpen] = useState(false);
+  const [fullscreen, setFullscreen] = useState(false);
   const [cameraDevices, setCameraDevices] = useState<MediaDeviceInfo[]>([]);
   const [activeCameraId, setActiveCameraId] = useState('');
   const [switchingCamera, setSwitchingCamera] = useState(false);
+  const [profile, setProfile] = useState<QualityProfile>(quality.profile);
 
   useEffect(() => {
     let mounted = true;
+    const stopWatching = quality.subscribe((next) => {
+      setProfile(next);
+      waveRef.current?.setProfile(next);
+    });
+
     void import('@/lib/wave-engine').then(({ createWaveEngine }) => {
       if (mounted && webglRef.current && videoRef.current) {
-        waveRef.current = createWaveEngine(webglRef.current, videoRef.current);
+        waveRef.current = createWaveEngine(
+          webglRef.current,
+          videoRef.current,
+          quality.profile,
+          // The renderer measures; the controller decides. A sustained shortfall
+          // drops a tier, and the tier drop reaches the tracker through the
+          // same subscription, so the depth model and the segmenter shut down
+          // without the pipeline being rebuilt.
+          (fps) => quality.observe(fps),
+        );
       }
     });
 
@@ -48,30 +102,41 @@ export default function Home() {
       if (event.target instanceof HTMLSelectElement || event.target instanceof HTMLInputElement) return;
       const key = event.key.toLowerCase();
       if (key === 'd') return handTrackerRef.current?.setDebug(event.shiftKey);
+      if (key === 'escape') return setReaderOpen(false);
+      if (key === 'n') return setReaderOpen(current => !current);
       if (key !== 'f') return;
       setFilmMode((current) => {
         const next = !current;
         handTrackerRef.current?.setDebug(false);
+        handTrackerRef.current?.setGuide(!next);
+        if (next) setReaderOpen(false);
         return next;
       });
     };
+    const onFullscreen = () => setFullscreen(Boolean(document.fullscreenElement));
+
     window.addEventListener('keydown', onKey);
+    document.addEventListener('fullscreenchange', onFullscreen);
     const watchdog = window.setInterval(() => {
+      // The callout is deliberately not hidden here. Losing tracking should not
+      // take the text away -- the tracker holds the block where it was, and the
+      // leader fades on its own because there is no hand left to point at.
       if (lastTrackingRef.current && performance.now() - lastTrackingRef.current > 650) {
-        if (labelRef.current) labelRef.current.style.opacity = '0';
         setHands(0);
       }
     }, 250);
 
     return () => {
       mounted = false;
+      stopWatching();
       window.clearInterval(watchdog);
       window.removeEventListener('keydown', onKey);
+      document.removeEventListener('fullscreenchange', onFullscreen);
       handTrackerRef.current?.destroy();
       waveRef.current?.destroy();
       streamRef.current?.getTracks().forEach((track) => track.stop());
     };
-  }, []);
+  }, [quality]);
 
   async function startCamera(deviceId?: string) {
     const previousStream = streamRef.current;
@@ -115,14 +180,18 @@ export default function Home() {
           waveRef.current?.setTracking(update);
           const now = performance.now();
           lastTrackingRef.current = now;
-          const label = labelRef.current;
-          if (label && stageRef.current) {
-            const { clientWidth: width, clientHeight: height } = stageRef.current;
-            const anchor = update.left.x > update.right.x ? update.left : update.right;
-            const x = Math.max(16, Math.min(width - 186, anchor.x + 32));
-            const y = Math.max(16, Math.min(height - 132, anchor.y + 44));
-            label.style.transform = `translate3d(${x}px, ${y}px, 0)`;
-            label.style.opacity = update.hands > 0 ? '1' : '0';
+          // Positioned imperatively: the tracker delivers this at video rate,
+          // and a React render per frame would cost more than the whole
+          // compositor. The tracker has already smoothed the position, so this
+          // is a straight write with no easing of its own on top.
+          const callout = calloutRef.current;
+          if (callout) {
+            const { x, y, side } = update.callout;
+            callout.style.transform = `translate3d(${x.toFixed(1)}px, ${y.toFixed(1)}px, 0)`;
+            callout.dataset.side = side;
+            // Revealed once, on the first frame that has a position to show,
+            // and never taken away again.
+            callout.dataset.ready = 'true';
           }
           if (now - lastMeterUpdateRef.current > 110) {
             lastMeterUpdateRef.current = now;
@@ -131,8 +200,9 @@ export default function Home() {
             setFieldState(update.state);
             setTrackingLabel(update.label);
           }
-        });
+        }, quality);
         tracker.setDebug(false);
+        tracker.setGuide(!filmMode);
         handTrackerRef.current = tracker;
       }
     } catch {
@@ -159,14 +229,38 @@ export default function Home() {
     else void document.exitFullscreen();
   }
 
-  const note = STATE_COPY[fieldState];
-  const energy = fieldState === 'clasped' ? 'High'
-    : fieldState === 'release' ? 'Falling'
-    : confinement > .72 ? 'High' : note.energy;
-  const cost = normalisedEnergy(confinement);
+  function toggleFilm() {
+    setFilmMode((current) => {
+      const next = !current;
+      handTrackerRef.current?.setGuide(!next);
+      if (next) setReaderOpen(false);
+      return next;
+    });
+  }
+
+  const note = STATE_NOTES[fieldState];
+  /**
+   * Levels, not digits. Each relation below is exact for the ideal box the
+   * renderer is running, but the dial driving it is a hand-distance estimate,
+   * so printing three decimals would claim a precision the input does not have.
+   * A meter states the same thing at the precision the gesture actually
+   * supports: where the value sits on its own range, and which way it is going.
+   */
+  const meters = useMemo(() => {
+    const held = fieldState === 'clasped' ? 1 : confinement;
+    return [
+      { id: 'width' as const, level: (relativeWellWidth(held) - .5) / .5, rising: false },
+      { id: 'energy' as const, level: (energyRatio(held) - 1) / 3, rising: true },
+      { id: 'momentum' as const, level: momentumRatio(held) - 1, rising: true },
+    ];
+  }, [confinement, fieldState]);
 
   return (
-    <main ref={stageRef} className={`stage ${filmMode ? 'film-mode' : ''}`} aria-label="Quantum state simulator">
+    <main
+      ref={stageRef}
+      className={`stage ${filmMode ? 'film-mode' : ''} ${interfaceHidden ? 'interface-hidden' : ''}`}
+      aria-label="Quantum confinement instrument"
+    >
       <video ref={videoRef} className="camera-feed" muted playsInline />
       <canvas ref={webglRef} className="wave-canvas" aria-hidden="true" />
       <canvas ref={trackingRef} className="tracking-canvas" aria-hidden="true" />
@@ -174,41 +268,135 @@ export default function Home() {
 
       {cameraState !== 'live' && (
         <section className="camera-gate">
+          <h1 className="display">Too Expensive to Collapse</h1>
+          <p>
+            An interactive on the quantum stability of matter. Hand tracking runs entirely in this
+            browser; no video leaves the device.
+          </p>
           <button type="button" onClick={() => void startCamera()} disabled={cameraState === 'starting'}>
-            <Video size={18} strokeWidth={1.5} />
+            <Video {...ICON} />
             {cameraState === 'starting' ? 'Starting…' : cameraState === 'error' ? 'Retry camera' : 'Enable camera'}
           </button>
-          <p>{cameraState === 'error' ? 'Check camera permission.' : 'Open palms. Bring them together.'}</p>
         </section>
       )}
 
-      {cameraState === 'live' && hands === 0 && !filmMode && (
-        <p className="gesture-hint">{trackingLabel.includes('unavailable') ? 'Hand tracking unavailable. Reload to retry.' : trackingLabel.includes('Loading') ? 'Finding your hands…' : 'Show your palms, or pinch.'}</p>
-      )}
-
-      <aside ref={labelRef} className="hand-label" aria-hidden={filmMode || hands === 0} data-energy={energy.toLowerCase()}>
-        <span className="hand-action">{note.action}</span>
-        <span className="hand-energy">Energy <strong>{energy}</strong></span>
-        <span className="energy-line" aria-hidden="true"><i style={{ transform: `scaleX(${fieldState === 'clasped' ? 1 : cost})` }} /></span>
+      {/* The state, its levels, and nothing else -- placed by the tracker, which
+          also draws the dot on the palm and the leader that reaches this block,
+          so the line always meets the text. */}
+      <aside ref={calloutRef} className="callout" aria-hidden={filmMode}>
+        <p className="callout-state">{note.title}</p>
+        <div className="meters">
+          {meters.map(({ id, level, rising }) => (
+            <div className="meter" key={id}>
+              <span className="meter-head">
+                <span className="meter-label">{READOUTS[id].label}</span>
+                <span className="meter-symbol"><Symbols text={READOUTS[id].symbol} /></span>
+              </span>
+              <span className="meter-track">
+                <i data-rising={rising} style={{ transform: `scaleX(${Math.max(0, Math.min(1, level))})` }} />
+              </span>
+            </div>
+          ))}
+          <div className="meter" data-fixed="true">
+            <span className="meter-head">
+              <span className="meter-label">{READOUTS.uncertainty.label}</span>
+              <span className="meter-symbol"><Symbols text="Δx·Δp ≥ ℏ/2" /></span>
+            </span>
+            {/* The tick is the bound; the marker is the ground state sitting
+                above it, and it does not move however hard the well is
+                squeezed. That refusal is the reading. */}
+            <span className="meter-track">
+              <u />
+              <b style={{ left: `${(UNCERTAINTY_MARK * 100).toFixed(1)}%` }} />
+            </span>
+          </div>
+        </div>
       </aside>
 
-      <footer className="simulator-footer">
-        <span className="simulator-note">Just a simulator.</span>
-        <div className="scene-controls">
-          {cameraState === 'live' && cameraDevices.length > 1 && (
-            <label className="camera-picker">
-              <Camera size={16} aria-hidden="true" />
-              <select value={activeCameraId} onChange={(event) => void startCamera(event.target.value)} disabled={switchingCamera} aria-label="Choose camera">
-                {cameraDevices.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label || 'Camera'}</option>)}
-              </select>
-            </label>
-          )}
-          <button type="button" onClick={() => setFilmMode(current => !current)} aria-label={filmMode ? 'Show state labels' : 'Hide state labels'} title="Toggle labels · F">
-            {filmMode ? <EyeOff size={17} /> : <Eye size={17} />}
+      <aside className="reader" data-open={readerOpen} aria-hidden={!readerOpen}>
+        <header>
+          <p className="meta">The physics</p>
+          <h2 className="display" style={{ marginTop: 12 }}>The stability of matter</h2>
+          <p>
+            Eight notes on why a Coulomb potential with no floor still produces atoms of a definite
+            size, and why bulk matter needs an argument that a single atom does not.
+          </p>
+        </header>
+        {SECTIONS.map((section) => (
+          <article key={section.id}>
+            <div className="article-head">
+              <span className="numeral">{section.index}</span>
+              <h3 className="section-head">{section.title}</h3>
+            </div>
+            {section.body.map((paragraph) => <p key={paragraph.slice(0, 24)}>{paragraph}</p>)}
+            <a href={section.source.href} target="_blank" rel="noreferrer noopener">{section.source.label}</a>
+          </article>
+        ))}
+        {/* Tier-dependent, so it is only rendered once the camera is live and
+            the client has measured the machine. Rendering it during the server
+            pass would describe a tier that only the server believes in. */}
+        {cameraState === 'live' && (
+          <article>
+            <div className="article-head">
+              <span className="numeral">—</span>
+              <h3 className="section-head">Rendering</h3>
+            </div>
+            <p>
+              Relighting runs on landmark geometry: a hand rig, a palm surface built from the
+              silhouette, {profile.faceMesh ? 'and an 852-triangle face mesh' : 'and no face mesh on this tier'}
+              {profile.denseDepth ? ', with dense monocular depth filling the rest of the room' : ''}. Quality
+              tier <span className="numeral">{profile.tier}</span>.
+            </p>
+          </article>
+        )}
+      </aside>
+
+      {/* The one standing line of text. It warns, and nothing more. It sits
+          after the reader in the DOM because the rule that steps it aside when
+          the reader opens is a following-sibling selector. */}
+      {cameraState === 'live' && (
+        <p className="warning">
+          {trackingLabel.includes('unavailable')
+            ? 'Hand tracking unavailable. Reload to retry.'
+            : trackingLabel.includes('Loading')
+              ? 'Finding your hands…'
+              : hands === 0
+                ? 'Show both palms, or pinch with one hand.'
+                : MODEL_CAVEAT}
+        </p>
+      )}
+
+      <nav className="tools" aria-label="Capture controls">
+        {cameraState === 'live' && cameraDevices.length > 1 && (
+          <label className="camera-picker" title="Camera source">
+            <SwitchCamera {...ICON} aria-hidden="true" />
+            <select
+              value={activeCameraId}
+              onChange={(event) => void startCamera(event.target.value)}
+              disabled={switchingCamera}
+              aria-label="Choose camera"
+            >
+              {cameraDevices.map((device) => (
+                <option key={device.deviceId} value={device.deviceId}>{device.label || 'Camera'}</option>
+              ))}
+            </select>
+          </label>
+        )}
+        {cameraState === 'live' && !filmMode && (
+          <button type="button" onClick={() => setReaderOpen(current => !current)} data-active={readerOpen} aria-label="The physics" title="The physics · N">
+            <BookOpen {...ICON} />
           </button>
-          <button type="button" onClick={toggleFullscreen} aria-label="Toggle fullscreen" title="Fullscreen"><Expand size={17} /></button>
-        </div>
-      </footer>
+        )}
+        <button type="button" onClick={toggleFilm} data-active={filmMode} aria-label={filmMode ? 'Leave film mode' : 'Film mode'} title="Film mode · F">
+          <Clapperboard {...ICON} />
+        </button>
+        <button type="button" onClick={() => setInterfaceHidden(current => !current)} data-active={interfaceHidden} aria-label={interfaceHidden ? 'Show interface' : 'Hide interface'} title="Interface">
+          {interfaceHidden ? <EyeOff {...ICON} /> : <Eye {...ICON} />}
+        </button>
+        <button type="button" onClick={toggleFullscreen} aria-label="Toggle fullscreen" title="Fullscreen">
+          {fullscreen ? <Minimize {...ICON} /> : <Maximize {...ICON} />}
+        </button>
+      </nav>
     </main>
   );
 }
