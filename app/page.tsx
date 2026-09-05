@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { BookOpen, Bug, Clapperboard, Eye, EyeOff, Maximize, Minimize, SwitchCamera, Video } from 'lucide-react';
-import type { RenderFeature, WaveDiagnosticStage, WaveEngine } from '@/lib/wave-engine';
+import type { WaveDiagnosticStage, WaveEngine } from '@/lib/wave-engine';
 import type { FieldState, HandTracker } from '@/lib/hand-tracker';
 import { createQualityController, type QualityProfile } from '@/lib/quality';
 import {
@@ -72,14 +72,6 @@ const DIAGNOSTIC_STAGES: Array<{ id: WaveDiagnosticStage; label: string }> = [
   { id: 'segmentation', label: '5 Segmentation' },
   { id: 'depth', label: '6 Depth / refraction' },
   { id: 'composite', label: '7 Final composite' },
-];
-
-const RENDER_FEATURES: Array<{ id: RenderFeature; label: string }> = [
-  { id: 'relighting', label: 'Relighting' },
-  { id: 'depth', label: 'Depth' },
-  { id: 'refraction', label: 'Refraction' },
-  { id: 'segmentation', label: 'Segmentation' },
-  { id: 'finalComposite', label: 'Final composite' },
 ];
 
 type RuntimeDiagnostics = Record<string, string>;
@@ -210,14 +202,6 @@ export default function Home() {
   const [diagnosticStage, setDiagnosticStage] = useState<WaveDiagnosticStage>('wave');
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   const [diagnostics, setDiagnostics] = useState<RuntimeDiagnostics>({});
-  const renderFeaturesRef = useRef<Record<RenderFeature, boolean>>({
-    relighting: true,
-    depth: true,
-    refraction: true,
-    segmentation: true,
-    finalComposite: true,
-  });
-  const [renderFeatures, setRenderFeatures] = useState(renderFeaturesRef.current);
 
   function enableGpuSafeMode() {
     gpuSafeModeRef.current = true;
@@ -233,23 +217,9 @@ export default function Home() {
     setDiagnosticStage(stage);
     // Sampling the video through Three is an opt-in diagnostic. The normal
     // experience always leaves the browser's video layer visible underneath.
-    waveRef.current?.setCameraCompositing(
-      stage === 'composite' && renderFeaturesRef.current.finalComposite && !gpuSafeModeRef.current,
-    );
+    waveRef.current?.setCameraCompositing(stage === 'composite' && !gpuSafeModeRef.current);
     waveRef.current?.setDiagnosticStage(stage);
     handTrackerRef.current?.setGuide(!filmMode && DIAGNOSTIC_STAGES.findIndex(({ id }) => id === stage) >= 2);
-  }
-
-  function toggleRenderFeature(feature: RenderFeature) {
-    const next = !renderFeaturesRef.current[feature];
-    renderFeaturesRef.current = { ...renderFeaturesRef.current, [feature]: next };
-    setRenderFeatures(renderFeaturesRef.current);
-    waveRef.current?.setRenderFeature(feature, next);
-    if (feature === 'finalComposite') {
-      waveRef.current?.setCameraCompositing(
-        next && diagnosticStageRef.current === 'composite' && !gpuSafeModeRef.current,
-      );
-    }
   }
 
   function toggleGpuSafeMode() {
@@ -353,7 +323,6 @@ export default function Home() {
       const userAgent = navigator.userAgent;
       const browser = /CriOS/.test(userAgent) ? 'Chrome iOS' : /FxiOS/.test(userAgent) ? 'Firefox iOS'
         : /Safari/.test(userAgent) ? 'Safari' : /Chrome/.test(userAgent) ? 'Chrome' : 'Unknown';
-      const timestamp = (value: number) => value ? `${value.toFixed(0)} ms` : 'none';
       setDiagnostics({
         build: __BUILD_ID__,
         platform: `${APPLE_TABLET ? 'Apple touch' : navigator.platform} / ${browser}`,
@@ -375,14 +344,6 @@ export default function Home() {
         'webcam texture': wave?.cameraTextureInitialized ? 'initialized' : 'not initialized',
         'render mode': wave?.cameraCompositing ? 'final composite' : 'native video + transparent overlay',
         stage: wave?.diagnosticStage ?? diagnosticStageRef.current,
-        frame: String(wave?.frame ?? 0),
-        'last camera frame': timestamp(wave?.lastCameraFrameAt ?? 0),
-        'last depth frame': timestamp(wave?.lastDepthFrameAt ?? 0),
-        'last relighting frame': timestamp(wave?.lastRelightingFrameAt ?? 0),
-        'render targets': wave?.renderTargets ?? 'none',
-        'texture null this frame': String(wave?.nullTextureThisFrame ?? false),
-        'clears without draw': wave?.clearsWithoutDraw ?? 'unknown',
-        'canvas element': wave?.canvasIdentity ?? 'none',
       });
     }, 400);
 
@@ -687,11 +648,6 @@ export default function Home() {
           <div className="diagnostic-stages" role="group" aria-label="Render stages">
             {DIAGNOSTIC_STAGES.map(({ id, label }) => (
               <button key={id} type="button" onClick={() => setRenderStage(id)} data-active={diagnosticStage === id}>{label}</button>
-            ))}
-          </div>
-          <div className="diagnostic-features" role="group" aria-label="Render subsystem toggles">
-            {RENDER_FEATURES.map(({ id, label }) => (
-              <button key={id} type="button" onClick={() => toggleRenderFeature(id)} data-active={renderFeatures[id]}>{label}</button>
             ))}
           </div>
           <dl>
