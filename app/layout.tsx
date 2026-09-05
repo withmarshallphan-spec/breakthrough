@@ -2,6 +2,8 @@ import type { Metadata } from 'next';
 import { Geist, Instrument_Serif } from 'next/font/google';
 import './globals.css';
 
+const publicAssetBasePath = process.env.GITHUB_PAGES === 'true' ? '/breakthrough' : '';
+
 // All three are SIL Open Font License 1.1, and next/font self-hosts the files
 // at build time -- nothing is requested from Google at runtime, and there is no
 // layout shift while they load.
@@ -27,7 +29,7 @@ export const metadata: Metadata = {
   title: 'Too Expensive to Collapse',
   description:
     'A hand-tracked interactive on the quantum stability of matter: the kinetic-energy cost of localisation, and why bulk matter needs fermionic antisymmetry.',
-  icons: { icon: '/favicon.svg' },
+  icons: { icon: `${publicAssetBasePath}/favicon.svg` },
 };
 
 export default function RootLayout({
@@ -43,6 +45,22 @@ export default function RootLayout({
     // the system font.
     <html lang="en" className={`${instrumentSerif.variable} ${geistSans.variable}`}>
       <body className="antialiased">
+        <style>{`
+          @font-face {
+            font-family: 'Alte Haas Grotesk';
+            src: url('${publicAssetBasePath}/fonts/alte-haas-grotesk/AlteHaasGroteskRegular.woff2') format('woff2');
+            font-weight: 400;
+            font-style: normal;
+            font-display: swap;
+          }
+          @font-face {
+            font-family: 'Alte Haas Grotesk';
+            src: url('${publicAssetBasePath}/fonts/alte-haas-grotesk/AlteHaasGroteskBold.woff2') format('woff2');
+            font-weight: 700;
+            font-style: normal;
+            font-display: swap;
+          }
+        `}</style>
         {/* The display face is self-hosted and small enough to fetch eagerly;
             the titles are the first thing on screen. Its licence text ships
             beside it, which is what that licence requires. */}
@@ -50,7 +68,7 @@ export default function RootLayout({
           rel="preload"
           as="font"
           type="font/woff2"
-          href="/fonts/alte-haas-grotesk/AlteHaasGroteskBold.woff2"
+          href={`${publicAssetBasePath}/fonts/alte-haas-grotesk/AlteHaasGroteskBold.woff2`}
           crossOrigin="anonymous"
         />
         {children}

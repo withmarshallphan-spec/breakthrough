@@ -5,21 +5,6 @@
    public/fonts/alte-haas-grotesk/LICENSE.txt. Self-hosted because the font is
    not on any webfont service; the .ttf files from the author's distribution
    were converted to woff2 and are otherwise unmodified. */
-@font-face {
-  font-family: 'Alte Haas Grotesk';
-  src: url('/fonts/alte-haas-grotesk/AlteHaasGroteskRegular.woff2') format('woff2');
-  font-weight: 400;
-  font-style: normal;
-  font-display: swap;
-}
-@font-face {
-  font-family: 'Alte Haas Grotesk';
-  src: url('/fonts/alte-haas-grotesk/AlteHaasGroteskBold.woff2') format('woff2');
-  font-weight: 700;
-  font-style: normal;
-  font-display: swap;
-}
-
 :root {
   /* Geist Sans and Geist Mono arrive as self-hosted variables from
      next/font/google. SIL Open Font License 1.1. */

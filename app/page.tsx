@@ -13,6 +13,10 @@ import {
 } from '@/lib/quantum';
 import { MODEL_CAVEAT, READOUTS, SECTIONS, STATE_NOTES } from '@/lib/science-copy';
 
+// This route has no server data or request-dependent output. Declaring it
+// static lets Vinext emit the HTML required by GitHub Pages.
+export const dynamic = 'force-static';
+
 /**
  * Instrument Serif has no U+2080, so a literal subscript zero falls back to
  * another face and arrives looking like the letter o -- `L / L₀` reads as
