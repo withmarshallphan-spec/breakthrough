@@ -17,6 +17,7 @@ export function createFieldStateMachine() {
   let lastNow = 0;
   let lastConfinement = 0;
   let seal = 0;
+  let pulse = 0;
   return {
     update(sample: GestureSample) {
       const { now, hands, gapRatio, confinement, nearClasp } = sample;
@@ -32,16 +33,21 @@ export function createFieldStateMachine() {
       const briefLoss = hands === 0 && wasClasped && now - lastClaspEvidence < 220;
       if (pairClasp || merged || briefLoss) state = 'clasped';
       else if (hands === 0) state = 'dormant';
-      else if (wasClasped) { state = 'release'; releaseUntil = now + 750; }
+      else if (wasClasped) { state = 'release'; releaseUntil = now + 750; pulse = 1; }
       else if (now < releaseUntil) state = 'release';
       else if (speed > .055 || (confinement > .36 && speed > -.055)) state = 'compressing';
       else state = 'open';
       const approach = hands === 2 ? .7 * Math.max(0, Math.min(1, (1.6 - gapRatio) / .48)) : 0;
       const targetSeal = state === 'clasped' ? 1 : approach;
       seal += (targetSeal - seal) * (1 - Math.exp(-dt / (targetSeal ? .09 : .24)));
+      // One decaying impulse at the instant a clasp opens. The renderer spends
+      // it on a brief expansion and bloom, so release is an event rather than a
+      // fade; it carries no physical meaning of its own.
+      pulse *= Math.exp(-dt / .32);
+      if (pulse < 1e-3) pulse = 0;
       lastNow = now;
       lastConfinement = confinement;
-      return { state, seal, holdAnchors: merged || briefLoss };
+      return { state, seal, pulse, holdAnchors: merged || briefLoss };
     },
   };
 }

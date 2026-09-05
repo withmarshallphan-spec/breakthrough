@@ -4,7 +4,8 @@ type Point = { x: number; y: number; z?: number };
 
 import { createFieldStateMachine, type FieldState } from './field-state';
 import { buildPalmFrame, fieldDepthFromEndpoints, nearnessFromDistance, type PalmFrame, type RigPoint } from './palm-geometry';
-export type { FieldState, PalmFrame, RigPoint };
+import { createPersonSegmenter, type PersonMask, type PersonSegmenter } from './segmentation';
+export type { FieldState, PalmFrame, PersonMask, RigPoint };
 
 export type TrackingUpdate = {
   confinement: number;
@@ -15,6 +16,8 @@ export type TrackingUpdate = {
   state: FieldState;
   /** 0 open, 1 fully sealed between the palms. */
   seal: number;
+  /** Decaying impulse spent on the moment a clasp opens. */
+  pulse: number;
   /** How squarely the palms face each other; 0 is edge-on. */
   facing: number;
   left: { x: number; y: number };
@@ -28,7 +31,13 @@ export type TrackingUpdate = {
   rig: RigPoint[][];
   /** Head proxy, when a face is visible. */
   face: FaceProxy | null;
-  fingertips: { x: number; y: number }[];
+  /** Whole-person coverage, when the segmenter is available. */
+  person: PersonMask | null;
+  /**
+   * Nearness the person silhouette is composited at. Segmentation has no depth
+   * of its own, so the measured head distance stands in for the whole body.
+   */
+  bodyDepth: number;
 };
 
 export type HandTracker = {
@@ -239,16 +248,26 @@ export async function createHandTracker(
   let controlsReady = false;
   let debug = false;
 
+  // Person segmentation is also optional, and it loads without blocking: hands
+  // and the field start immediately, and the silhouette joins the compositor
+  // whenever the model arrives.
+  let segmenter: PersonSegmenter | null = null;
+  let personMask: PersonMask | null = null;
+  void createPersonSegmenter(vision)
+    .then((created) => { if (destroyed) created?.destroy(); else segmenter = created; })
+    .catch(() => { segmenter = null; });
+
   // State machine memory.
   const machine = createFieldStateMachine();
   let state: FieldState = 'dormant';
   let lastFrameTime = 0;
-  let claspCenter = new Vector2();
+  const claspCenter = new Vector2();
   let claspRadius = 1;
   let heldDepths = [.5, .5];
   let previousCenters: Vector2[] = [];
   let previousRig: RigPoint[][] = [];
   let seal = 0;
+  let pulse = 0;
   let smoothedFacing = 0;
   let smoothedDepth = .5;
   let lastGapRatio = 99;
@@ -466,6 +485,7 @@ export async function createHandTracker(
       gapRatio: lastGapRatio, confinement: targetConfinement, nearClasp });
     state = transition.state;
     seal = transition.seal;
+    pulse = transition.pulse;
     if (state === 'clasped' && hands.length === 2) {
       claspCenter.copy(targetLeft).add(targetRight).multiplyScalar(.5);
       claspRadius = Math.max(targetLeft.distanceTo(targetRight), 35);
@@ -518,6 +538,7 @@ export async function createHandTracker(
     };
 
     drawHands(hands, width, height, mode);
+    const proxy = buildFace(face, width, height);
 
     // Hands live in the near part of the depth range so the head proxy can sit
     // behind them; within that band their own z spread is preserved.
@@ -567,11 +588,6 @@ export async function createHandTracker(
     const normalisedPlane = fieldDepthFromEndpoints({ x: 0, y: 0, z: leftDepth }, { x: 0, y: 0, z: rightDepth });
     smoothedDepth += (normalisedPlane - smoothedDepth) * ease(.1);
 
-    const fingertips = hands.flatMap((hand) => [4, 8, 12, 16, 20].map((id) => {
-      const point = toScreen(hand[id], width, height);
-      return { x: point.x, y: point.y };
-    }));
-
     onUpdate({
       confinement: smoothedConfinement,
       presence,
@@ -580,14 +596,19 @@ export async function createHandTracker(
       mode,
       state,
       seal,
+      pulse,
       facing: smoothedFacing,
       left: { x: control.left.x, y: control.left.y },
       right: { x: control.right.x, y: control.right.y },
       fieldDepth: smoothedDepth,
       leftDepth, rightDepth, palms,
       rig,
-      face: buildFace(face, width, height),
-      fingertips,
+      face: proxy,
+      person: personMask,
+      // Without a head there is no measured distance for a body, so the
+      // silhouette is parked behind the scene: it can still catch rim light,
+      // but it never wrongly swallows the field.
+      bodyDepth: proxy ? Math.max(proxy.depth - .035, 0) : .1,
     });
   }
 
@@ -613,6 +634,8 @@ export async function createHandTracker(
           face = null;
         }
       }
+      // The silhouette is sampled from the same frame the landmarks came from.
+      if (segmenter) personMask = segmenter.update(video, video.videoWidth, video.videoHeight, stamp) ?? personMask;
       updateControl(result.landmarks as Point[][], face, width, height);
     }
     animationFrame = requestAnimationFrame(predict);
@@ -633,6 +656,8 @@ export async function createHandTracker(
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       handLandmarker.close();
       faceLandmarker?.close();
+      segmenter?.destroy();
+      segmenter = null;
     },
   };
 }
