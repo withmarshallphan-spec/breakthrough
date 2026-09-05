@@ -53,16 +53,14 @@ type CameraConstraints = MediaTrackConstraints & {
 };
 
 // iPadOS identifies itself as macOS in desktop-mode Safari, so touch support
-// is part of the test. This is deliberately a runtime toggle, not a build-time
-// branch: a camera-texture failure on any device can promote it to safe mode.
+// is part of the platform readout in the diagnostics panel.
 const APPLE_TABLET = typeof navigator !== 'undefined' && (
   /iPad/.test(navigator.userAgent)
   || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
 );
-// The stage ladder established that iPad's final camera-texture compositor is
-// the failing boundary. Start there in native-video overlay mode; the final
-// composite remains available in diagnostics for future device testing.
-const IOS_SAFE_MODE = APPLE_TABLET;
+// Native video is the source of truth on every device. The GPU-only camera
+// composite remains a diagnostic stage, never the default presentation path.
+const GPU_SAFE_MODE = false;
 
 declare const __BUILD_ID__: string;
 
@@ -198,16 +196,16 @@ export default function Home() {
   const [switchingCamera, setSwitchingCamera] = useState(false);
   const [profile, setProfile] = useState<QualityProfile>(quality.profile);
   const [rendererAvailable, setRendererAvailable] = useState(true);
-  const iosSafeModeRef = useRef(IOS_SAFE_MODE);
-  const [iosSafeMode, setIosSafeMode] = useState(IOS_SAFE_MODE);
-  const diagnosticStageRef = useRef<WaveDiagnosticStage>('composite');
-  const [diagnosticStage, setDiagnosticStage] = useState<WaveDiagnosticStage>('composite');
+  const gpuSafeModeRef = useRef(GPU_SAFE_MODE);
+  const [gpuSafeMode, setGpuSafeMode] = useState(GPU_SAFE_MODE);
+  const diagnosticStageRef = useRef<WaveDiagnosticStage>('wave');
+  const [diagnosticStage, setDiagnosticStage] = useState<WaveDiagnosticStage>('wave');
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   const [diagnostics, setDiagnostics] = useState<RuntimeDiagnostics>({});
 
-  function enableIosSafeMode() {
-    iosSafeModeRef.current = true;
-    setIosSafeMode(true);
+  function enableGpuSafeMode() {
+    gpuSafeModeRef.current = true;
+    setGpuSafeMode(true);
     // This is intentionally independent of renderer availability. A healthy
     // WebGL canvas can still have an unusable camera texture on iOS.
     waveRef.current?.setCameraCompositing(false);
@@ -217,18 +215,21 @@ export default function Home() {
   function setRenderStage(stage: WaveDiagnosticStage) {
     diagnosticStageRef.current = stage;
     setDiagnosticStage(stage);
+    // Sampling the video through Three is an opt-in diagnostic. The normal
+    // experience always leaves the browser's video layer visible underneath.
+    waveRef.current?.setCameraCompositing(stage === 'composite' && !gpuSafeModeRef.current);
     waveRef.current?.setDiagnosticStage(stage);
     handTrackerRef.current?.setGuide(!filmMode && DIAGNOSTIC_STAGES.findIndex(({ id }) => id === stage) >= 2);
   }
 
-  function toggleIosSafeMode() {
-    if (!iosSafeModeRef.current) {
-      enableIosSafeMode();
+  function toggleGpuSafeMode() {
+    if (!gpuSafeModeRef.current) {
+      enableGpuSafeMode();
       return;
     }
-    iosSafeModeRef.current = false;
-    setIosSafeMode(false);
-    waveRef.current?.setCameraCompositing(diagnosticStageRef.current === 'composite');
+    gpuSafeModeRef.current = false;
+    setGpuSafeMode(false);
+    waveRef.current?.setCameraCompositing(false);
     // Rebuild optional stages from the live user gesture. Safe mode tears them
     // down intentionally, so turning it off needs a fresh tracker instance.
     if (streamRef.current) void startCamera(activeCameraId || undefined);
@@ -269,12 +270,12 @@ export default function Home() {
           // same subscription, so the depth model and the segmenter shut down
           // without the pipeline being rebuilt.
           (fps) => quality.observe(fps),
-          { cameraCompositing: !iosSafeModeRef.current },
+          { cameraCompositing: false },
         );
         waveRef.current.setDiagnosticStage(diagnosticStageRef.current);
-        if (videoRef.current.srcObject) {
+        if (videoRef.current.srcObject && diagnosticStageRef.current === 'composite') {
           void cameraPipelineIsHealthy(videoRef.current, waveRef.current).then((healthy) => {
-            if (mounted && !healthy) enableIosSafeMode();
+            if (mounted && !healthy) enableGpuSafeMode();
           });
         }
       } catch {
@@ -286,7 +287,7 @@ export default function Home() {
       if (event.metaKey || event.ctrlKey || event.altKey) return;
       if (event.target instanceof HTMLSelectElement || event.target instanceof HTMLInputElement) return;
       const key = event.key.toLowerCase();
-      if (key === 'i') return toggleIosSafeMode();
+      if (key === 'i') return toggleGpuSafeMode();
       if (key === 'x') return setDiagnosticsOpen(current => !current);
       if (key === 'd') return handTrackerRef.current?.setDebug(event.shiftKey);
       if (key === 'escape') return setReaderOpen(false);
@@ -389,9 +390,10 @@ export default function Home() {
         await videoRef.current.play();
         handTrackerRef.current?.destroy();
         handTrackerRef.current = null;
-        const pipelineHealthy = await cameraPipelineIsHealthy(videoRef.current, waveRef.current);
-        if (!pipelineHealthy) enableIosSafeMode();
-        else if (!iosSafeModeRef.current) waveRef.current?.setCameraCompositing(true);
+        if (diagnosticStageRef.current === 'composite') {
+          const pipelineHealthy = await cameraPipelineIsHealthy(videoRef.current, waveRef.current);
+          if (!pipelineHealthy) enableGpuSafeMode();
+        }
       }
 
       previousStream?.getTracks().forEach((track) => track.stop());
@@ -433,8 +435,8 @@ export default function Home() {
             setTrackingLabel(update.label);
           }
         }, quality, {
-          iosSafeMode: iosSafeModeRef.current,
-          onAdvancedStageFailure: enableIosSafeMode,
+          safeMode: gpuSafeModeRef.current,
+          onAdvancedStageFailure: enableGpuSafeMode,
         });
         tracker.setDebug(false);
         tracker.setGuide(!filmMode && DIAGNOSTIC_STAGES.findIndex(({ id }) => id === diagnosticStageRef.current) >= 2);
@@ -495,7 +497,6 @@ export default function Home() {
       ref={stageRef}
       className={`stage ${filmMode ? 'film-mode' : ''} ${interfaceHidden ? 'interface-hidden' : ''}`}
       data-renderer={rendererAvailable ? 'webgl' : 'video'}
-      data-ios-safe-mode={iosSafeMode ? 'true' : 'false'}
       data-diagnostic-stage={diagnosticStage}
       aria-label="Quantum confinement instrument"
     >
@@ -642,7 +643,7 @@ export default function Home() {
         <aside className="diagnostics" aria-label="Camera pipeline diagnostics">
           <header>
             <p className="meta">camera diagnostics</p>
-            <button type="button" onClick={toggleIosSafeMode} data-active={iosSafeMode}>I Safe mode</button>
+            <button type="button" onClick={toggleGpuSafeMode} data-active={gpuSafeMode}>I GPU safe mode</button>
           </header>
           <div className="diagnostic-stages" role="group" aria-label="Render stages">
             {DIAGNOSTIC_STAGES.map(({ id, label }) => (

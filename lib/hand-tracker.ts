@@ -109,11 +109,11 @@ export type HandTracker = {
 
 export type HandTrackerOptions = {
   /**
-   * Keep the iOS path to the one model it needs: hand landmarks. The optional
+   * Keep the safe path to the one model it needs: hand landmarks. The optional
    * face, segmentation, and neural-depth stages all feed advanced compositing
    * and must not jeopardise the native camera fallback.
   */
-  iosSafeMode?: boolean;
+  safeMode?: boolean;
   /** Lets the renderer move to native-video overlay mode if an optional stage fails. */
   onAdvancedStageFailure?: () => void;
 };
@@ -198,9 +198,9 @@ export async function createHandTracker(
   canvas: HTMLCanvasElement,
   onUpdate: (update: TrackingUpdate) => void,
   quality: QualityController,
-  { iosSafeMode = false, onAdvancedStageFailure }: HandTrackerOptions = {},
+  { safeMode: initialSafeMode = false, onAdvancedStageFailure }: HandTrackerOptions = {},
 ): Promise<HandTracker> {
-  let safeMode = iosSafeMode;
+  let safeMode = initialSafeMode;
   const { FaceLandmarker, FilesetResolver, HandLandmarker } = await import('@mediapipe/tasks-vision');
   const vision = await FilesetResolver.forVisionTasks(
     'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm',
