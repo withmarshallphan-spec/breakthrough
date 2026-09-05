@@ -20,6 +20,7 @@ export type WaveEngine = {
   /** Keep the native video visible and render only the field into the canvas. */
   setCameraCompositing: (enabled: boolean) => void;
   setDiagnosticStage: (stage: WaveDiagnosticStage) => void;
+  setRenderFeature: (feature: RenderFeature, enabled: boolean) => void;
   getDiagnostics: () => WaveEngineDiagnostics;
   /** Tests the actual WebGL video texture, rather than only the HTML video. */
   hasCameraTexturePixels: () => boolean;
@@ -40,11 +41,26 @@ export type WaveDiagnosticStage =
   | 'depth'
   | 'composite';
 
+export type RenderFeature = 'relighting' | 'depth' | 'refraction' | 'segmentation' | 'finalComposite';
+
+export type RenderFeatures = Record<RenderFeature, boolean>;
+
 export type WaveEngineDiagnostics = {
   webgl2: boolean;
   cameraTextureInitialized: boolean;
   cameraCompositing: boolean;
   diagnosticStage: WaveDiagnosticStage;
+  frame: number;
+  canvasCssSize: string;
+  canvasBackingSize: string;
+  renderTargets: string;
+  lastCameraFrameAt: number;
+  lastDepthFrameAt: number;
+  lastRelightingFrameAt: number;
+  nullTextureThisFrame: boolean;
+  clearsWithoutDraw: string;
+  canvasIdentity: string;
+  features: RenderFeatures;
 };
 
 const DIAGNOSTIC_STAGE_ORDER: Record<WaveDiagnosticStage, number> = {
@@ -609,6 +625,8 @@ const compositeFragmentShader = /* glsl */ `
   uniform float uSeal;
   uniform float uHasOccluder;
   uniform float uCameraCompositing;
+  uniform float uRelighting;
+  uniform float uRefraction;
   varying vec2 vUv;
 
   // How pronounced the inferred relief is. Higher shapes the subject harder
@@ -669,7 +687,7 @@ const compositeFragmentShader = /* glsl */ `
       vec3 halo = texture2D(tLight, vUv).rgb;
       // Keep the fallback local and calm. Screen blending made the low-level
       // blur act like a flickering full-frame exposure adjustment on iPad.
-      vec3 overlay = emission * .92 + halo * 1.1;
+      vec3 overlay = emission * .92 + halo * 1.1 * uRelighting;
       overlay = vec3(1.0) - exp(-overlay * .8);
       float alpha = clamp(max(max(overlay.r, overlay.g), overlay.b) * .62, 0.0, .72);
       gl_FragColor = vec4(overlay, alpha);
@@ -711,9 +729,9 @@ const compositeFragmentShader = /* glsl */ `
     float slope = dpsi(t, 0.0) * amp / span;
     float dist = abs(d - y) * inversesqrt(1.0 + slope * slope);
     float wellGate = step(0.0, t) * step(t, 1.0);
-    float lens = exp(-(dist * dist) / (glowWidth * glowWidth)) * uPresence * (1.0 - uSeal) * wellGate * visible;
+    float lens = exp(-(dist * dist) / (glowWidth * glowWidth)) * uPresence * (1.0 - uSeal) * wellGate * visible * uRefraction;
     vec2 knotOffset = q - (left + right) * .5;
-    float claspLens = exp(-dot(knotOffset, knotOffset) / max(uPalmScale * uPalmScale * .8, .0001)) * uSeal * uPresence * visible;
+    float claspLens = exp(-dot(knotOffset, knotOffset) / max(uPalmScale * uPalmScale * .8, .0001)) * uSeal * uPresence * visible * uRefraction;
     vec2 nUv = vec2(nrm.x / aspect, nrm.y) * .5;
     float strength = (.012 + uEnergy * .026 + uCritical * .022) * lens;
     vec2 offset = nUv * clamp((d - y) / max(glowWidth, .001), -1.5, 1.5) * strength;
@@ -848,7 +866,7 @@ const compositeFragmentShader = /* glsl */ `
     // Skin is not opaque; a near source bleeds a little through it wherever it
     // lands, which is what keeps the match light off the surface of a mask.
     scattering += tint * matchLight * material * coverage * .22;
-    vec3 color = albedo * (uAmbient + lit) + scattering;
+    vec3 color = albedo * (uAmbient + lit * uRelighting) + scattering * uRelighting;
     color += emissive;
 
     // Backlight. Light wraps a silhouette where the surface turns away from the
@@ -864,7 +882,7 @@ const compositeFragmentShader = /* glsl */ `
     // Sealed, the same edges are where light escapes between the fingers, so
     // the catch is where a clasp shows its gaps.
     float edgeCatch = rimEdge * inFront * luma(behindLight) * (1.0 + uSeal * 1.8);
-    color += mix(SILVER, tint, .4) * (wrap + edgeCatch) * uPresence;
+    color += mix(SILVER, tint, .4) * (wrap + edgeCatch) * uPresence * uRelighting;
 
     // Light sealed between the palms has nowhere to go but through them. Thin
     // parts of a silhouette pass the most, so the grazing term carries this
@@ -876,7 +894,7 @@ const compositeFragmentShader = /* glsl */ `
     float held = exp(-dot(knotOffset, knotOffset) / max(uPalmScale * uPalmScale * 2.2, .0001));
     float transmit = uSeal * frontCoverage * held * luma(irradiance) * SEAL_TRANSMIT
       * (.3 + .7 * grazing) * depthFalloff * uPresence * (1.0 + uSeal * .6);
-    color += mix(tint, SILVER, .2) * transmit;
+    color += mix(tint, SILVER, .2) * transmit * uRelighting;
 
     gl_FragColor = vec4(color, 1.0);
   }
@@ -1233,6 +1251,13 @@ export function createWaveEngine(
   onFrameRate?: (fps: number) => void,
   options: WaveEngineOptions = {},
 ): WaveEngine {
+  const features: RenderFeatures = {
+    relighting: true,
+    depth: true,
+    refraction: true,
+    segmentation: true,
+    finalComposite: true,
+  };
   let requestedCameraCompositing = options.cameraCompositing ?? true;
   let diagnosticStage: WaveDiagnosticStage = 'composite';
   let cameraCompositing = requestedCameraCompositing;
@@ -1245,6 +1270,8 @@ export function createWaveEngine(
     antialias: false,
     powerPreference: 'high-performance',
   });
+  const canvasIdentity = `wave-${Math.random().toString(36).slice(2, 8)}`;
+  canvas.dataset.waveCanvasId = canvasIdentity;
   renderer.setClearColor(cameraCompositing ? 0x010304 : 0x000000, cameraCompositing ? 1 : 0);
   // Older iPad GPUs can sample half-float textures but cannot render into
   // them. Falling back to 8-bit buffers preserves the whole interaction,
@@ -1319,7 +1346,7 @@ export function createWaveEngine(
   envScene.add(new THREE.Mesh(screenGeometry, cameraMaterial));
 
   function updateCameraCompositing() {
-    cameraCompositing = requestedCameraCompositing && diagnosticStage === 'composite';
+    cameraCompositing = requestedCameraCompositing && features.finalComposite && diagnosticStage === 'composite';
     cameraUniforms.uCameraCompositing.value = cameraCompositing ? 1 : 0;
     renderer.setClearColor(cameraCompositing ? 0x010304 : 0x000000, cameraCompositing ? 1 : 0);
   }
@@ -1553,6 +1580,8 @@ export function createWaveEngine(
       uLightTexel: { value: lightTexel },
       uHasOccluder: { value: 0 },
       uCameraCompositing: cameraUniforms.uCameraCompositing,
+      uRelighting: { value: 1 },
+      uRefraction: { value: 1 },
     },
     depthTest: false,
     depthWrite: false,
@@ -1654,6 +1683,23 @@ export function createWaveEngine(
   let pixelRatio = 1;
   let animationFrame = 0;
   let destroyed = false;
+  let frame = 0;
+  let lastVideoTime = -1;
+  let lastCameraFrameAt = 0;
+  let lastDepthFrameAt = 0;
+  let lastRelightingFrameAt = 0;
+  let nullTextureThisFrame = false;
+  const clearsWithoutDraw = new Set<string>();
+
+  function clearPass(name: string) {
+    clearsWithoutDraw.add(name);
+    renderer.clear();
+  }
+
+  function drawPass(name: string, scene: THREE.Scene, activeCamera: THREE.Camera) {
+    renderer.render(scene, activeCamera);
+    clearsWithoutDraw.delete(name);
+  }
   let renderedParticleCount = fullParticleCount;
   let fpsWindowStart = performance.now();
   let fpsFrames = 0;
@@ -1736,6 +1782,8 @@ export function createWaveEngine(
     shared.uPresence.value = currentPresence * facing;
     shared.uMode.value = currentMode;
     shared.uPulse.value = currentPulse;
+    compositeMaterial.uniforms.uRelighting.value = features.relighting ? 1 : 0;
+    compositeMaterial.uniforms.uRefraction.value = features.refraction ? 1 : 0;
 
     gradePass.uniforms.uTime.value = time;
     gradePass.uniforms.uResolution.value.copy(resolution);
@@ -1990,7 +2038,7 @@ export function createWaveEngine(
    * spreading it evenly over hair and clothing, which reflect nothing like it.
    */
   function updatePersonMask(mask: FieldTracking['person'], bodyDepth: number) {
-    if (!mask || DIAGNOSTIC_STAGE_ORDER[diagnosticStage] < DIAGNOSTIC_STAGE_ORDER.segmentation) {
+    if (!mask || !features.segmentation || DIAGNOSTIC_STAGE_ORDER[diagnosticStage] < DIAGNOSTIC_STAGE_ORDER.segmentation) {
       personMesh.visible = false;
       return;
     }
@@ -2022,7 +2070,7 @@ export function createWaveEngine(
 
   /** Upload the aligned dense depth map, when the depth model is running. */
   function updateDepthMap(map: FieldTracking['depth']) {
-    if (!map || DIAGNOSTIC_STAGE_ORDER[diagnosticStage] < DIAGNOSTIC_STAGE_ORDER.depth) {
+    if (!map || !features.depth || DIAGNOSTIC_STAGE_ORDER[diagnosticStage] < DIAGNOSTIC_STAGE_ORDER.depth) {
       hasDepthUniform.value = 0;
       return;
     }
@@ -2040,6 +2088,7 @@ export function createWaveEngine(
     if (map.version !== depthVersion) {
       depthVersion = map.version;
       depthTexture.needsUpdate = true;
+      lastDepthFrameAt = performance.now();
     }
     hasDepthUniform.value = 1;
   }
@@ -2121,6 +2170,13 @@ export function createWaveEngine(
 
   function render(now: number) {
     if (destroyed) return;
+    frame += 1;
+    clearsWithoutDraw.clear();
+    nullTextureThisFrame = !visibleTarget.texture || !blurTargets[1].texture || !palmTarget.texture;
+    if (video.currentTime !== lastVideoTime) {
+      lastVideoTime = video.currentTime;
+      lastCameraFrameAt = now;
+    }
     timer.update(now);
     const scale = reduceMotion ? .24 : 1;
     const delta = Math.min(timer.getDelta(), .05);
@@ -2138,7 +2194,9 @@ export function createWaveEngine(
     if (diagnosticStage === 'raw' || diagnosticStage === 'transparent' || diagnosticStage === 'tracking') {
       renderer.setClearColor(0x000000, 0);
       renderer.setRenderTarget(null);
-      renderer.clear();
+      clearPass('canvas');
+      // These stages deliberately present the native video without a WebGL draw.
+      clearsWithoutDraw.delete('canvas');
       watchPerformance(now);
       animationFrame = requestAnimationFrame(render);
       return;
@@ -2146,8 +2204,8 @@ export function createWaveEngine(
 
     if (cameraCompositing) {
       renderer.setRenderTarget(environmentTarget);
-      renderer.clear();
-      renderer.render(envScene, camera);
+      clearPass('environment');
+      drawPass('environment', envScene, camera);
     }
 
     // The rig is cleared to fully transparent so coverage reads as alpha.
@@ -2157,8 +2215,9 @@ export function createWaveEngine(
     faceSurfaceMaterial.uniforms.uDepthBias.value = 0;
     renderer.setRenderTarget(rigTarget);
     renderer.setClearColor(0x000000, 0);
-    renderer.clear();
-    if (occluderActive) renderer.render(rigScene, rigCamera);
+    clearPass('rig');
+    if (occluderActive) drawPass('rig', rigScene, rigCamera);
+    else clearsWithoutDraw.delete('rig');
 
     // Pass two decides what may cut the field, and only the hands qualify.
     // The face is deliberately absent: the wave passes across a face rather
@@ -2173,8 +2232,9 @@ export function createWaveEngine(
     personMesh.visible = false;
     faceMesh.visible = false;
     renderer.setRenderTarget(frontTarget);
-    renderer.clear();
-    if (handRigCount > 0) renderer.render(rigScene, rigCamera);
+    clearPass('front');
+    if (handRigCount > 0) drawPass('front', rigScene, rigCamera);
+    else clearsWithoutDraw.delete('front');
     rigMesh.count = allNodes;
     personMesh.visible = personWasVisible;
     faceMesh.visible = faceWasVisible;
@@ -2183,12 +2243,12 @@ export function createWaveEngine(
     // irradiance the composite lights the room with.
     renderer.setClearColor(0x000000, 1);
     renderer.setRenderTarget(palmTarget);
-    renderer.clear();
-    renderer.render(palmScene, camera);
+    clearPass('palm');
+    drawPass('palm', palmScene, camera);
     shared.uOcclusion.value = 0;
     renderer.setRenderTarget(emissiveTarget);
-    renderer.clear();
-    renderer.render(emissiveScene, camera);
+    clearPass('emissive');
+    drawPass('emissive', emissiveScene, camera);
 
     blurMaterial.uniforms.tSource.value = emissiveTarget.texture;
     for (let pass = 0; pass < blurPasses; pass += 1) {
@@ -2201,8 +2261,9 @@ export function createWaveEngine(
           axis === 0 ? 0 : lightTexel.y * reach,
         );
         renderer.setRenderTarget(blurTargets[axis]);
-        renderer.clear();
-        renderer.render(blurScene, camera);
+        const blurName = axis === 0 ? 'blur-x' : 'blur-y';
+        clearPass(blurName);
+        drawPass(blurName, blurScene, camera);
       }
     }
     compositeMaterial.uniforms.tLight.value = blurTargets[1].texture;
@@ -2210,14 +2271,19 @@ export function createWaveEngine(
     // in the irradiance buffer for edge wrap and light leaking through gaps.
     shared.uOcclusion.value = 1;
     renderer.setRenderTarget(visibleTarget);
-    renderer.clear();
-    renderer.render(emissiveScene, camera);
+    clearPass('visible');
+    drawPass('visible', emissiveScene, camera);
 
     renderer.setClearColor(cameraCompositing ? 0x010304 : 0x000000, cameraCompositing ? 1 : 0);
     renderer.setRenderTarget(null);
-    renderer.clear();
-    if (cameraCompositing) composer.render();
-    else renderer.render(mainScene, camera);
+    clearPass('canvas');
+    if (cameraCompositing) {
+      composer.render();
+      clearsWithoutDraw.delete('canvas');
+    } else {
+      drawPass('canvas', mainScene, camera);
+    }
+    if (features.relighting) lastRelightingFrameAt = now;
 
     watchPerformance(now);
     animationFrame = requestAnimationFrame(render);
@@ -2247,12 +2313,36 @@ export function createWaveEngine(
       if (DIAGNOSTIC_STAGE_ORDER[stage] < DIAGNOSTIC_STAGE_ORDER.segmentation) updatePersonMask(null, .1);
       if (DIAGNOSTIC_STAGE_ORDER[stage] < DIAGNOSTIC_STAGE_ORDER.depth) updateDepthMap(null);
     },
+    setRenderFeature(feature, enabled) {
+      features[feature] = enabled;
+      if (feature === 'finalComposite') updateCameraCompositing();
+      if (feature === 'segmentation' && !enabled) updatePersonMask(null, .1);
+      if (feature === 'depth' && !enabled) updateDepthMap(null);
+    },
     getDiagnostics() {
+      const targetSize = (name: string, target: THREE.WebGLRenderTarget) => `${name}:${target.width}x${target.height}`;
       return {
         webgl2: renderer.capabilities.isWebGL2,
         cameraTextureInitialized: videoTexture.image === video && video.videoWidth > 0,
         cameraCompositing,
         diagnosticStage,
+        frame,
+        canvasCssSize: `${Math.round(canvas.clientWidth)}x${Math.round(canvas.clientHeight)}`,
+        canvasBackingSize: `${canvas.width}x${canvas.height}`,
+        renderTargets: [
+          targetSize('environment', environmentTarget),
+          targetSize('rig', rigTarget),
+          targetSize('emissive', emissiveTarget),
+          targetSize('visible', visibleTarget),
+          targetSize('blur', blurTargets[1]),
+        ].join(' '),
+        lastCameraFrameAt,
+        lastDepthFrameAt,
+        lastRelightingFrameAt,
+        nullTextureThisFrame,
+        clearsWithoutDraw: [...clearsWithoutDraw].join(',') || 'none',
+        canvasIdentity,
+        features: { ...features },
       };
     },
     hasCameraTexturePixels() {
