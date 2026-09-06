@@ -137,7 +137,7 @@ export async function createPersonSegmenter(
   // Segmentation is the slowest of the MediaPipe models and the silhouette is
   // the slowest-changing signal. A fixed input shape also means the Three
   // texture is allocated once and never swaps underneath a live render pass.
-  let interval = 250;
+  let interval = 125;
   let failures = 0;
 
   return {
@@ -213,7 +213,7 @@ export async function createPersonSegmenter(
 
       const cost = performance.now() - started;
       if (cost > 18) interval = Math.min(interval * 1.35, 800);
-      else if (cost < 9) interval = Math.max(interval * .94, 220);
+      else if (cost < 9) interval = Math.max(interval * .94, 120);
       return mask;
     },
     destroy() {

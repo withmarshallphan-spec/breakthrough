@@ -99,6 +99,15 @@ button { font: inherit; color: inherit; }
 .diagnostic-features { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin: 12px 0; }
 .diagnostic-stages button,
 .diagnostic-features button { text-align: left; }
+.diagnostic-graph { display: grid; gap: 5px; margin: 12px 0; padding: 10px 0; border-block: 1px solid rgba(226, 236, 244, .12); }
+.diagnostic-graph > div { display: grid; grid-template-columns: 82px minmax(36px, 1fr) 22px 46px auto; align-items: center; gap: 6px; min-width: 0; }
+.diagnostic-graph span { color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.diagnostic-graph i { display: block; height: 4px; overflow: hidden; background: rgba(207, 225, 242, .13); }
+.diagnostic-graph b { display: block; height: 100%; width: 100%; transform-origin: left; background: var(--ice); }
+.diagnostic-graph strong,
+.diagnostic-graph em,
+.diagnostic-graph small { font: inherit; font-size: .68rem; font-style: normal; color: var(--ink-3); white-space: nowrap; }
+.diagnostic-graph strong { color: var(--ink); text-align: right; }
 .diagnostics dl { display: grid; gap: 4px; margin: 0; }
 .diagnostics dl > div { display: grid; grid-template-columns: minmax(110px, 1fr) auto; gap: 12px; border-top: 1px solid rgba(226, 236, 244, .1); padding-top: 4px; }
 .diagnostics dt { color: var(--ink-3); }

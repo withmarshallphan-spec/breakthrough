@@ -20,6 +20,7 @@ export type WaveEngine = {
   /** Keep the native video visible and render only the field into the canvas. */
   setCameraCompositing: (enabled: boolean) => void;
   setDiagnosticStage: (stage: WaveDiagnosticStage) => void;
+  setDiagnosticsEnabled: (enabled: boolean) => void;
   setRenderFeature: (feature: RenderFeature, enabled: boolean) => void;
   getDiagnostics: () => WaveEngineDiagnostics;
   /** Tests the actual WebGL video texture, rather than only the HTML video. */
@@ -41,9 +42,20 @@ export type WaveDiagnosticStage =
   | 'depth'
   | 'composite';
 
-export type RenderFeature = 'relighting' | 'depth' | 'refraction' | 'segmentation' | 'finalComposite';
+export type RenderFeature = 'relighting' | 'depth' | 'refraction' | 'segmentation' | 'particles' | 'finalComposite';
 
 export type RenderFeatures = Record<RenderFeature, boolean>;
+
+export type RenderSubsystemDiagnostics = {
+  fps: number;
+  lastAt: number;
+  lastDuration: number;
+  updates: number;
+  skipped: number;
+  writesTexture: boolean;
+  clearsTarget: boolean;
+  preservesPrevious: boolean;
+};
 
 export type WaveEngineDiagnostics = {
   webgl2: boolean;
@@ -54,10 +66,19 @@ export type WaveEngineDiagnostics = {
   canvasCssSize: string;
   canvasBackingSize: string;
   renderTargets: string;
+  resizeCount: number;
+  lastResizeAt: number;
+  shaderProgramCount: number;
+  personTextureAllocations: number;
+  depthTextureAllocations: number;
   lastCameraFrameAt: number;
   lastSegmentationFrameAt: number;
   lastDepthFrameAt: number;
   lastRelightingFrameAt: number;
+  renderFps: number;
+  blackFlashCount: number;
+  lastBlackFlashAt: number;
+  subsystems: Record<'relighting' | 'refraction' | 'particles' | 'finalComposite', RenderSubsystemDiagnostics>;
   nullTextureThisFrame: boolean;
   clearsWithoutDraw: string;
   canvasIdentity: string;
@@ -1262,6 +1283,7 @@ export function createWaveEngine(
     depth: true,
     refraction: true,
     segmentation: true,
+    particles: true,
     finalComposite: true,
   };
   let requestedCameraCompositing = options.cameraCompositing ?? true;
@@ -1598,6 +1620,7 @@ export function createWaveEngine(
 
   const filamentGeometry = createFilamentGeometry(256);
   const filamentMaterials: THREE.ShaderMaterial[] = [];
+  const filaments: THREE.Mesh[] = [];
   const layerCount = 9;
   for (let i = 0; i < layerCount; i += 1) {
     const material = new THREE.ShaderMaterial({
@@ -1614,6 +1637,7 @@ export function createWaveEngine(
     const strand = new THREE.Mesh(filamentGeometry, material);
     strand.frustumCulled = false;
     strand.renderOrder = i;
+    filaments.push(strand);
     emissiveScene.add(strand);
   }
 
@@ -1695,8 +1719,48 @@ export function createWaveEngine(
   let lastSegmentationFrameAt = 0;
   let lastDepthFrameAt = 0;
   let lastRelightingFrameAt = 0;
+  let lastRenderFps = 0;
+  let resizeCount = 0;
+  let lastResizeAt = 0;
+  let personTextureAllocations = 0;
+  let depthTextureAllocations = 0;
+  let diagnosticsEnabled = false;
+  let previousCameraProbeWasLit = false;
+  let blackFlashCount = 0;
+  let lastBlackFlashAt = 0;
   let nullTextureThisFrame = false;
   const clearsWithoutDraw = new Set<string>();
+  const renderSubsystems: Record<'relighting' | 'refraction' | 'particles' | 'finalComposite', RenderSubsystemDiagnostics> = {
+    relighting: { fps: 0, lastAt: 0, lastDuration: 0, updates: 0, skipped: 0, writesTexture: true, clearsTarget: true, preservesPrevious: true },
+    refraction: { fps: 0, lastAt: 0, lastDuration: 0, updates: 0, skipped: 0, writesTexture: false, clearsTarget: false, preservesPrevious: true },
+    particles: { fps: 0, lastAt: 0, lastDuration: 0, updates: 0, skipped: 0, writesTexture: true, clearsTarget: true, preservesPrevious: true },
+    finalComposite: { fps: 0, lastAt: 0, lastDuration: 0, updates: 0, skipped: 0, writesTexture: true, clearsTarget: true, preservesPrevious: true },
+  };
+  let renderMetricWindowStarted = performance.now();
+  const renderMetricUpdates: Record<'relighting' | 'refraction' | 'particles' | 'finalComposite', number> = {
+    relighting: 0, refraction: 0, particles: 0, finalComposite: 0,
+  };
+
+  function noteRenderSubsystem(
+    subsystem: 'relighting' | 'refraction' | 'particles' | 'finalComposite',
+    started: number,
+    now: number,
+    enabled: boolean,
+  ) {
+    const metric = renderSubsystems[subsystem];
+    if (!enabled) { metric.skipped += 1; return; }
+    metric.lastAt = now;
+    metric.lastDuration = now - started;
+    metric.updates += 1;
+    renderMetricUpdates[subsystem] += 1;
+    const elapsed = now - renderMetricWindowStarted;
+    if (elapsed < 1000) return;
+    (Object.keys(renderSubsystems) as Array<keyof typeof renderSubsystems>).forEach((name) => {
+      renderSubsystems[name].fps = renderMetricUpdates[name] * 1000 / elapsed;
+      renderMetricUpdates[name] = 0;
+    });
+    renderMetricWindowStarted = now;
+  }
 
   function clearPass(name: string) {
     clearsWithoutDraw.add(name);
@@ -1706,6 +1770,35 @@ export function createWaveEngine(
   function drawPass(name: string, scene: THREE.Scene, activeCamera: THREE.Camera) {
     renderer.render(scene, activeCamera);
     clearsWithoutDraw.delete(name);
+  }
+
+  function sampleCompositeCamera(now: number) {
+    if (!diagnosticsEnabled || !cameraCompositing || frame % 12 !== 0) return;
+    const previousTarget = renderer.getRenderTarget();
+    const previousClearColor = renderer.getClearColor(new THREE.Color());
+    const previousClearAlpha = renderer.getClearAlpha();
+    const pixels = new Uint8Array(8 * 8 * 4);
+    try {
+      renderer.setRenderTarget(cameraProbeTarget);
+      renderer.setClearColor(0x000000, 1);
+      renderer.clear();
+      renderer.render(envScene, camera);
+      renderer.readRenderTargetPixels(cameraProbeTarget, 0, 0, 8, 8, pixels);
+      let brightPixels = 0;
+      for (let index = 0; index < pixels.length; index += 4) {
+        if (Math.max(pixels[index], pixels[index + 1], pixels[index + 2]) > 10) brightPixels += 1;
+      }
+      if (brightPixels >= 3) previousCameraProbeWasLit = true;
+      else if (previousCameraProbeWasLit && brightPixels < 2) {
+        blackFlashCount += 1;
+        lastBlackFlashAt = now;
+      }
+    } catch {
+      // The normal native-video fallback remains responsible if a probe fails.
+    } finally {
+      renderer.setClearColor(previousClearColor, previousClearAlpha);
+      renderer.setRenderTarget(previousTarget);
+    }
   }
   let renderedParticleCount = fullParticleCount;
   let fpsWindowStart = performance.now();
@@ -2054,6 +2147,7 @@ export function createWaveEngine(
     if (!personTexture) {
       personPacked = new Uint8Array(pixels * 2);
       personTexture = new THREE.DataTexture(personPacked, mask.width, mask.height, THREE.RGFormat);
+      personTextureAllocations += 1;
       personTexture.minFilter = THREE.LinearFilter;
       personTexture.magFilter = THREE.LinearFilter;
       personTexture.unpackAlignment = 1;
@@ -2089,6 +2183,7 @@ export function createWaveEngine(
     if (!depthTexture || image?.width !== map.width || image?.height !== map.height) {
       depthTexture?.dispose();
       depthTexture = new THREE.DataTexture(map.data, map.width, map.height, THREE.RedFormat);
+      depthTextureAllocations += 1;
       depthTexture.minFilter = THREE.LinearFilter;
       depthTexture.magFilter = THREE.LinearFilter;
       depthTexture.unpackAlignment = 1;
@@ -2108,6 +2203,12 @@ export function createWaveEngine(
     width = canvas.clientWidth || window.innerWidth;
     height = canvas.clientHeight || window.innerHeight;
     pixelRatio = Math.min(window.devicePixelRatio, window.innerWidth < 720 ? 1.15 : 1.45);
+    const backingWidth = Math.round(width * pixelRatio);
+    const backingHeight = Math.round(height * pixelRatio);
+    if (canvas.width !== backingWidth || canvas.height !== backingHeight) {
+      resizeCount += 1;
+      lastResizeAt = performance.now();
+    }
     renderer.setPixelRatio(pixelRatio);
     renderer.setSize(width, height, false);
     environmentTarget.setSize(Math.round(width * pixelRatio), Math.round(height * pixelRatio));
@@ -2140,6 +2241,7 @@ export function createWaveEngine(
     const elapsed = now - fpsWindowStart;
     if (elapsed < 1800) return;
     const fps = fpsFrames * 1000 / elapsed;
+    lastRenderFps = fps;
     onFrameRate?.(fps);
     lowFpsWindows = fps < 47 ? lowFpsWindows + 1 : 0;
     if (lowFpsWindows >= 2 && renderedParticleCount > 2400) {
@@ -2181,6 +2283,7 @@ export function createWaveEngine(
 
   function render(now: number) {
     if (destroyed) return;
+    const renderStarted = performance.now();
     frame += 1;
     clearsWithoutDraw.clear();
     nullTextureThisFrame = !visibleTarget.texture || !blurTargets[1].texture || !palmTarget.texture;
@@ -2208,6 +2311,11 @@ export function createWaveEngine(
       clearPass('canvas');
       // These stages deliberately present the native video without a WebGL draw.
       clearsWithoutDraw.delete('canvas');
+      const finished = performance.now();
+      noteRenderSubsystem('relighting', renderStarted, finished, false);
+      noteRenderSubsystem('refraction', renderStarted, finished, false);
+      noteRenderSubsystem('particles', renderStarted, finished, false);
+      noteRenderSubsystem('finalComposite', renderStarted, finished, false);
       watchPerformance(now);
       animationFrame = requestAnimationFrame(render);
       return;
@@ -2217,6 +2325,7 @@ export function createWaveEngine(
       renderer.setRenderTarget(environmentTarget);
       clearPass('environment');
       drawPass('environment', envScene, camera);
+      sampleCompositeCamera(now);
     }
 
     // The rig is cleared to fully transparent so coverage reads as alpha.
@@ -2296,6 +2405,12 @@ export function createWaveEngine(
     }
     if (features.relighting) lastRelightingFrameAt = now;
 
+    const finished = performance.now();
+    noteRenderSubsystem('relighting', renderStarted, finished, features.relighting);
+    noteRenderSubsystem('refraction', renderStarted, finished, features.refraction && cameraCompositing);
+    noteRenderSubsystem('particles', renderStarted, finished, features.particles);
+    noteRenderSubsystem('finalComposite', renderStarted, finished, features.finalComposite);
+
     watchPerformance(now);
     animationFrame = requestAnimationFrame(render);
   }
@@ -2324,11 +2439,19 @@ export function createWaveEngine(
       if (DIAGNOSTIC_STAGE_ORDER[stage] < DIAGNOSTIC_STAGE_ORDER.segmentation) updatePersonMask(null, .1);
       if (DIAGNOSTIC_STAGE_ORDER[stage] < DIAGNOSTIC_STAGE_ORDER.depth) updateDepthMap(null);
     },
+    setDiagnosticsEnabled(enabled) {
+      diagnosticsEnabled = enabled;
+    },
     setRenderFeature(feature, enabled) {
       features[feature] = enabled;
       if (feature === 'finalComposite') updateCameraCompositing();
       if (feature === 'segmentation' && !enabled) updatePersonMask(null, .1);
       if (feature === 'depth' && !enabled) updateDepthMap(null);
+      if (feature === 'particles') {
+        emissiveField.visible = enabled;
+        particles.visible = enabled;
+        filaments.forEach((strand) => { strand.visible = enabled; });
+      }
     },
     getDiagnostics() {
       const targetSize = (name: string, target: THREE.WebGLRenderTarget) => `${name}:${target.width}x${target.height}`;
@@ -2347,10 +2470,22 @@ export function createWaveEngine(
           targetSize('visible', visibleTarget),
           targetSize('blur', blurTargets[1]),
         ].join(' '),
+        resizeCount,
+        lastResizeAt,
+        shaderProgramCount: renderer.info.programs?.length ?? 0,
+        personTextureAllocations,
+        depthTextureAllocations,
         lastCameraFrameAt,
         lastSegmentationFrameAt,
         lastDepthFrameAt,
         lastRelightingFrameAt,
+        renderFps: lastRenderFps,
+        blackFlashCount,
+        lastBlackFlashAt,
+        subsystems: Object.fromEntries(
+          (Object.keys(renderSubsystems) as Array<keyof typeof renderSubsystems>)
+            .map((name) => [name, { ...renderSubsystems[name] }]),
+        ) as WaveEngineDiagnostics['subsystems'],
         nullTextureThisFrame,
         clearsWithoutDraw: [...clearsWithoutDraw].join(',') || 'none',
         canvasIdentity,

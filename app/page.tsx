@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { BookOpen, Bug, Clapperboard, Eye, EyeOff, Maximize, Minimize, SwitchCamera, Video } from 'lucide-react';
 import type { RenderFeature, WaveDiagnosticStage, WaveEngine } from '@/lib/wave-engine';
-import type { FieldState, HandTracker } from '@/lib/hand-tracker';
+import type { FieldState, HandTracker, TrackerSubsystem } from '@/lib/hand-tracker';
 import { createQualityController, type QualityProfile } from '@/lib/quality';
 import {
   energyRatio,
@@ -76,11 +76,30 @@ const DIAGNOSTIC_STAGES: Array<{ id: WaveDiagnosticStage; label: string }> = [
 
 const RENDER_FEATURES: Array<{ id: RenderFeature; label: string }> = [
   { id: 'relighting', label: 'Relighting' },
-  { id: 'depth', label: 'Depth' },
+  { id: 'depth', label: 'Depth render' },
   { id: 'refraction', label: 'Refraction' },
-  { id: 'segmentation', label: 'Segmentation' },
+  { id: 'segmentation', label: 'Segmentation render' },
+  { id: 'particles', label: 'Particles / volume' },
   { id: 'finalComposite', label: 'Final composite' },
 ];
+
+const TRACKER_FEATURES: Array<{ id: TrackerSubsystem; label: string }> = [
+  { id: 'hands', label: 'Hand tracking' },
+  { id: 'face', label: 'Face tracking' },
+  { id: 'segmentation', label: 'Segmentation inference' },
+  { id: 'depth', label: 'Depth inference' },
+];
+
+type SubsystemMetricRow = {
+  name: string;
+  fps: number;
+  lastDuration: number;
+  updates: number;
+  skipped: number;
+  writesTexture: boolean;
+  clearsTarget: boolean;
+  preservesPrevious: boolean;
+};
 
 type RuntimeDiagnostics = Record<string, string>;
 
@@ -215,9 +234,18 @@ export default function Home() {
     depth: true,
     refraction: true,
     segmentation: true,
+    particles: true,
     finalComposite: true,
   });
   const [renderFeatures, setRenderFeatures] = useState(renderFeaturesRef.current);
+  const trackerFeaturesRef = useRef<Record<TrackerSubsystem, boolean>>({
+    hands: true,
+    face: true,
+    segmentation: true,
+    depth: true,
+  });
+  const [trackerFeatures, setTrackerFeatures] = useState(trackerFeaturesRef.current);
+  const [subsystemMetrics, setSubsystemMetrics] = useState<SubsystemMetricRow[]>([]);
 
   function enableGpuSafeMode() {
     gpuSafeModeRef.current = true;
@@ -252,6 +280,13 @@ export default function Home() {
     }
   }
 
+  function toggleTrackerFeature(feature: TrackerSubsystem) {
+    const next = !trackerFeaturesRef.current[feature];
+    trackerFeaturesRef.current = { ...trackerFeaturesRef.current, [feature]: next };
+    setTrackerFeatures(trackerFeaturesRef.current);
+    handTrackerRef.current?.setSubsystem(feature, next);
+  }
+
   function toggleGpuSafeMode() {
     if (!gpuSafeModeRef.current) {
       enableGpuSafeMode();
@@ -264,6 +299,10 @@ export default function Home() {
     // down intentionally, so turning it off needs a fresh tracker instance.
     if (streamRef.current) void startCamera(activeCameraId || undefined);
   }
+
+  useEffect(() => {
+    waveRef.current?.setDiagnosticsEnabled(diagnosticsOpen);
+  }, [diagnosticsOpen]);
 
   useEffect(() => {
     let mounted = true;
@@ -282,8 +321,10 @@ export default function Home() {
       waveRef.current = null;
       setRendererAvailable(false);
     };
+    let contextLostCount = 0;
     const onContextLost = (event: Event) => {
       event.preventDefault();
+      contextLostCount += 1;
       fallBackToVideo();
     };
     canvas?.addEventListener('webglcontextlost', onContextLost);
@@ -302,6 +343,7 @@ export default function Home() {
           (fps) => quality.observe(fps),
           { cameraCompositing: false },
         );
+        waveRef.current.setDiagnosticsEnabled(diagnosticsOpen);
         waveRef.current.setDiagnosticStage(diagnosticStageRef.current);
         if (videoRef.current.srcObject && diagnosticStageRef.current === 'composite') {
           void cameraPipelineIsHealthy(videoRef.current, waveRef.current).then((healthy) => {
@@ -343,6 +385,37 @@ export default function Home() {
         setHands(0);
       }
     }, 250);
+    const blackProbe = document.createElement('canvas');
+    blackProbe.width = 12;
+    blackProbe.height = 12;
+    const blackProbeContext = blackProbe.getContext('2d', { willReadFrequently: true });
+    let lastProbedVideoTime = -1;
+    let sawLitCameraFrame = false;
+    let blackFlashCount = 0;
+    let lastBlackFlashAt = 0;
+    // This measures the decoded camera separately from the WebGL canvas. A
+    // black event here points at camera/ML contention; a stable camera with a
+    // black compositor points at a render target or final pass instead.
+    const blackWatchdog = window.setInterval(() => {
+      const video = videoRef.current;
+      if (!video || !blackProbeContext || video.readyState < 2 || video.currentTime === lastProbedVideoTime) return;
+      lastProbedVideoTime = video.currentTime;
+      try {
+        blackProbeContext.drawImage(video, 0, 0, blackProbe.width, blackProbe.height);
+        const pixels = blackProbeContext.getImageData(0, 0, blackProbe.width, blackProbe.height).data;
+        let brightPixels = 0;
+        for (let index = 0; index < pixels.length; index += 4) {
+          if (Math.max(pixels[index], pixels[index + 1], pixels[index + 2]) > 10) brightPixels += 1;
+        }
+        if (brightPixels >= 6) sawLitCameraFrame = true;
+        else if (sawLitCameraFrame && brightPixels < 2) {
+          blackFlashCount += 1;
+          lastBlackFlashAt = performance.now();
+        }
+      } catch {
+        // A protected or transient video frame is not a black-frame signal.
+      }
+    }, 90);
     const diagnosticWatchdog = window.setInterval(() => {
       const video = videoRef.current;
       const track = streamRef.current?.getVideoTracks()[0];
@@ -354,6 +427,13 @@ export default function Home() {
       const browser = /CriOS/.test(userAgent) ? 'Chrome iOS' : /FxiOS/.test(userAgent) ? 'Firefox iOS'
         : /Safari/.test(userAgent) ? 'Safari' : /Chrome/.test(userAgent) ? 'Chrome' : 'Unknown';
       const timestamp = (value: number) => value ? `${value.toFixed(0)} ms` : 'none';
+      const trackerRows: SubsystemMetricRow[] = tracker
+        ? (Object.entries(tracker.subsystems) as Array<[string, SubsystemMetricRow]>).map(([name, metric]) => ({ name, ...metric }))
+        : [];
+      const renderRows: SubsystemMetricRow[] = wave
+        ? (Object.entries(wave.subsystems) as Array<[string, SubsystemMetricRow]>).map(([name, metric]) => ({ name, ...metric }))
+        : [];
+      setSubsystemMetrics([...trackerRows, ...renderRows]);
       setDiagnostics({
         build: __BUILD_ID__,
         platform: `${APPLE_TABLET ? 'Apple touch' : navigator.platform} / ${browser}`,
@@ -376,11 +456,22 @@ export default function Home() {
         'render mode': wave?.cameraCompositing ? 'final composite' : 'native video + transparent overlay',
         stage: wave?.diagnosticStage ?? diagnosticStageRef.current,
         frame: String(wave?.frame ?? 0),
+        'render FPS': wave?.renderFps?.toFixed(1) ?? '0',
+        'black flashes, video': String(blackFlashCount),
+        'last black flash, video': timestamp(lastBlackFlashAt),
+        'black flashes, composite': String(wave?.blackFlashCount ?? 0),
+        'last black flash, composite': timestamp(wave?.lastBlackFlashAt ?? 0),
+        'WebGL context losses': String(contextLostCount),
         'last camera frame': timestamp(wave?.lastCameraFrameAt ?? 0),
         'last segmentation frame': timestamp(wave?.lastSegmentationFrameAt ?? 0),
         'last depth frame': timestamp(wave?.lastDepthFrameAt ?? 0),
         'last relighting frame': timestamp(wave?.lastRelightingFrameAt ?? 0),
         'render targets': wave?.renderTargets ?? 'none',
+        'render target resizes': String(wave?.resizeCount ?? 0),
+        'last render resize': timestamp(wave?.lastResizeAt ?? 0),
+        'shader programs': String(wave?.shaderProgramCount ?? 0),
+        'person texture allocations': String(wave?.personTextureAllocations ?? 0),
+        'depth texture allocations': String(wave?.depthTextureAllocations ?? 0),
         'texture null this frame': String(wave?.nullTextureThisFrame ?? false),
         'clears without draw': wave?.clearsWithoutDraw ?? 'unknown',
         'canvas element': wave?.canvasIdentity ?? 'none',
@@ -391,6 +482,7 @@ export default function Home() {
       mounted = false;
       stopWatching();
       window.clearInterval(watchdog);
+      window.clearInterval(blackWatchdog);
       window.clearInterval(diagnosticWatchdog);
       window.removeEventListener('keydown', onKey);
       document.removeEventListener('fullscreenchange', onFullscreen);
@@ -479,6 +571,9 @@ export default function Home() {
           onAdvancedStageFailure: enableGpuSafeMode,
         });
         tracker.setDebug(false);
+        (Object.keys(trackerFeaturesRef.current) as TrackerSubsystem[]).forEach((feature) => {
+          tracker.setSubsystem(feature, trackerFeaturesRef.current[feature]);
+        });
         tracker.setGuide(!filmMode && DIAGNOSTIC_STAGES.findIndex(({ id }) => id === diagnosticStageRef.current) >= 2);
         handTrackerRef.current = tracker;
       }
@@ -693,6 +788,22 @@ export default function Home() {
           <div className="diagnostic-features" role="group" aria-label="Render subsystem toggles">
             {RENDER_FEATURES.map(({ id, label }) => (
               <button key={id} type="button" onClick={() => toggleRenderFeature(id)} data-active={renderFeatures[id]}>{label}</button>
+            ))}
+          </div>
+          <div className="diagnostic-features" role="group" aria-label="Tracking subsystem toggles">
+            {TRACKER_FEATURES.map(({ id, label }) => (
+              <button key={id} type="button" onClick={() => toggleTrackerFeature(id)} data-active={trackerFeatures[id]}>{label}</button>
+            ))}
+          </div>
+          <div className="diagnostic-graph" aria-label="Subsystem timing">
+            {subsystemMetrics.map((metric) => (
+              <div key={metric.name} title={`updates ${metric.updates}; skipped ${metric.skipped}; writes texture ${metric.writesTexture}; clears target ${metric.clearsTarget}; preserves previous ${metric.preservesPrevious}`}>
+                <span>{metric.name}</span>
+                <i><b style={{ transform: `scaleX(${Math.min(1, metric.fps / 60)})` }} /></i>
+                <strong>{metric.fps.toFixed(0)}</strong>
+                <em>{metric.lastDuration.toFixed(1)} ms</em>
+                <small>{metric.writesTexture ? 'W' : '-'}{metric.clearsTarget ? 'C' : '-'} s{metric.skipped} {metric.preservesPrevious ? 'hold' : 'drop'}</small>
+              </div>
             ))}
           </div>
           <dl>

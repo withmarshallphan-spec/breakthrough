@@ -99,15 +99,54 @@ const CALLOUT_TAU = .21;
  */
 const CALLOUT_SWITCH_HYSTERESIS = 110;
 
+export type TrackerSubsystem = 'hands' | 'face' | 'segmentation' | 'depth';
+
+export type SubsystemDiagnostics = {
+  fps: number;
+  lastAt: number;
+  lastDuration: number;
+  updates: number;
+  skipped: number;
+  writesTexture: boolean;
+  clearsTarget: boolean;
+  preservesPrevious: boolean;
+};
+
+const SCHEDULE_INTERVALS: Record<TrackerSubsystem, number> = {
+  // Only one inference starts on a decoded frame. The hand rig gets the
+  // shortest deadline; optional models use the remaining frame slots.
+  hands: 1000 / 24,
+  face: 1000 / 20,
+  segmentation: 1000 / 8,
+  depth: 1000 / 6,
+};
+
+function createSubsystemDiagnostics(writesTexture: boolean): SubsystemDiagnostics {
+  return {
+    fps: 0,
+    lastAt: 0,
+    lastDuration: 0,
+    updates: 0,
+    skipped: 0,
+    writesTexture,
+    clearsTarget: false,
+    // The renderer keeps the previous texture until a complete new result is
+    // ready, never exposing an inference-in-progress buffer.
+    preservesPrevious: true,
+  };
+}
+
 export type HandTracker = {
   setDebug: (enabled: boolean) => void;
   setGuide: (enabled: boolean) => void;
   setSafeMode: (enabled: boolean) => void;
+  setSubsystem: (subsystem: TrackerSubsystem, enabled: boolean) => void;
   getDiagnostics: () => {
     segmentation: boolean;
     segmentationDelegate: 'CPU' | 'off';
     depth: boolean;
     safeMode: boolean;
+    subsystems: Record<TrackerSubsystem, SubsystemDiagnostics>;
   };
   destroy: () => void;
 };
@@ -269,7 +308,29 @@ export async function createHandTracker(
   let destroyed = false;
   let animationFrame = 0;
   let lastVideoTime = -1;
-  let faceFrameCounter = 0;
+  const enabledSubsystems: Record<TrackerSubsystem, boolean> = {
+    hands: true,
+    face: !safeMode,
+    segmentation: !safeMode,
+    depth: !safeMode,
+  };
+  const subsystemDiagnostics: Record<TrackerSubsystem, SubsystemDiagnostics> = {
+    hands: createSubsystemDiagnostics(false),
+    face: createSubsystemDiagnostics(false),
+    segmentation: createSubsystemDiagnostics(true),
+    depth: createSubsystemDiagnostics(true),
+  };
+  const lastSubsystemRun: Record<TrackerSubsystem, number> = {
+    hands: -Infinity,
+    face: -Infinity,
+    segmentation: -Infinity,
+    depth: -Infinity,
+  };
+  let diagnosticWindowStarted = performance.now();
+  const diagnosticWindowUpdates: Record<TrackerSubsystem, number> = {
+    hands: 0, face: 0, segmentation: 0, depth: 0,
+  };
+  let lastHandLandmarks: Point[][] = [];
   let lastFaceLandmarks: Point[] | null = null;
   let lastFaceMatrix: { data: number[] } | undefined;
   let smoothedConfinement = 0.08;
@@ -278,6 +339,22 @@ export async function createHandTracker(
   let debug = false;
   let guideVisible = true;
   const guide = createGuideLine();
+
+  function noteSubsystemUpdate(subsystem: TrackerSubsystem, started: number, now: number) {
+    const metric = subsystemDiagnostics[subsystem];
+    metric.lastAt = now;
+    metric.lastDuration = now - started;
+    metric.updates += 1;
+    diagnosticWindowUpdates[subsystem] += 1;
+    lastSubsystemRun[subsystem] = now;
+    const elapsed = now - diagnosticWindowStarted;
+    if (elapsed < 1000) return;
+    (Object.keys(subsystemDiagnostics) as TrackerSubsystem[]).forEach((name) => {
+      subsystemDiagnostics[name].fps = diagnosticWindowUpdates[name] * 1000 / elapsed;
+      diagnosticWindowUpdates[name] = 0;
+    });
+    diagnosticWindowStarted = now;
+  }
 
   // Person segmentation is optional, and it loads without blocking: hands and
   // the field start immediately, and the silhouette joins the compositor
@@ -466,7 +543,7 @@ export async function createHandTracker(
    */
   function alignDepth(rawHands: Point[][], rig: RigPoint[][], face: FaceFrame | null, faceLandmarks: Point[] | null) {
     const estimator = depthEstimator;
-    if (!estimator) return;
+    if (!estimator || !enabledSubsystems.depth) return;
     const raw = estimator.take();
     if (!raw) return;
 
@@ -722,7 +799,7 @@ export async function createHandTracker(
 
     // The head, as a surface rather than an ellipsoid.
     let face: FaceFrame | null = null;
-    if (faceLandmarks && quality.profile.faceMesh) {
+    if (faceLandmarks && quality.profile.faceMesh && enabledSubsystems.face) {
       faceVertexScratch = faceVertexScratch ?? new Float32Array(478 * 3);
       face = buildFaceFrame(
         faceLandmarks,
@@ -816,10 +893,10 @@ export async function createHandTracker(
       leftDepth, rightDepth, palms,
       rig,
       handScale: rig === previousRig && !hands.length ? previousScales : handScale,
-      face,
+      face: enabledSubsystems.face ? face : null,
       faceTriangles,
-      person: personMask,
-      depth: depthMap,
+      person: enabledSubsystems.segmentation ? personMask : null,
+      depth: enabledSubsystems.depth ? depthMap : null,
       // Without a head there is no measured distance for a body, so the
       // silhouette is parked behind the scene: it can still catch rim light,
       // but it never wrongly swallows the field.
@@ -834,28 +911,52 @@ export async function createHandTracker(
     const { width, height } = resize();
     if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
       lastVideoTime = video.currentTime;
-      const stamp = performance.now();
-      const result = handLandmarker.detectForVideo(video, stamp);
-      let face: Point[] | null = null;
-      if (!safeMode && faceLandmarker && quality.profile.faceMesh) {
+      const now = performance.now();
+      const candidates = (Object.keys(SCHEDULE_INTERVALS) as TrackerSubsystem[]).filter((subsystem) => {
+        if (!enabledSubsystems[subsystem] || now - lastSubsystemRun[subsystem] < SCHEDULE_INTERVALS[subsystem]) return false;
+        if (subsystem === 'face') return Boolean(faceLandmarker && quality.profile.faceMesh);
+        if (subsystem === 'segmentation') return Boolean(segmenter && quality.profile.segmentation);
+        if (subsystem === 'depth') return Boolean(depthEstimator && quality.profile.denseDepth);
+        return true;
+      });
+      // Most overdue wins. This keeps the calls serial even when every model
+      // becomes due at once after a slow frame; the other due tasks are
+      // explicitly recorded as skipped and retain their last valid outputs.
+      const selected = candidates.sort((a, b) =>
+        (now - lastSubsystemRun[b]) / SCHEDULE_INTERVALS[b]
+        - (now - lastSubsystemRun[a]) / SCHEDULE_INTERVALS[a],
+      )[0];
+      candidates.forEach((subsystem) => {
+        if (subsystem !== selected) subsystemDiagnostics[subsystem].skipped += 1;
+      });
+
+      if (selected === 'hands') {
+        const started = performance.now();
+        const result = handLandmarker.detectForVideo(video, now);
+        lastHandLandmarks = result.landmarks as Point[][];
+        noteSubsystemUpdate('hands', started, performance.now());
+        updateControl(lastHandLandmarks, enabledSubsystems.face ? lastFaceLandmarks : null, width, height);
+      } else if (selected === 'face' && faceLandmarker) {
+        const started = performance.now();
         try {
-          // Face geometry changes far slower than hands, so it is sampled at
-          // half rate to keep two models inside the frame budget.
-          faceFrameCounter = (faceFrameCounter + 1) % 2;
-          if (faceFrameCounter === 0) {
-            const faceResult = faceLandmarker.detectForVideo(video, stamp);
-            lastFaceLandmarks = (faceResult.faceLandmarks?.[0] as Point[] | undefined) ?? null;
-            lastFaceMatrix = faceResult.facialTransformationMatrixes?.[0];
-          }
-          face = lastFaceLandmarks;
+          const result = faceLandmarker.detectForVideo(video, now);
+          lastFaceLandmarks = (result.faceLandmarks?.[0] as Point[] | undefined) ?? null;
+          lastFaceMatrix = result.facialTransformationMatrixes?.[0];
         } catch {
-          face = null;
+          lastFaceLandmarks = null;
+          lastFaceMatrix = undefined;
         }
+        noteSubsystemUpdate('face', started, performance.now());
+        if (lastHandLandmarks.length) updateControl(lastHandLandmarks, lastFaceLandmarks, width, height);
+      } else if (selected === 'segmentation' && segmenter) {
+        const started = performance.now();
+        personMask = segmenter.update(video, video.videoWidth, video.videoHeight, now) ?? personMask;
+        noteSubsystemUpdate('segmentation', started, performance.now());
+      } else if (selected === 'depth' && depthEstimator) {
+        const started = performance.now();
+        depthEstimator.submit(video, now);
+        noteSubsystemUpdate('depth', started, performance.now());
       }
-      // The silhouette is sampled from the same frame the landmarks came from.
-      if (segmenter) personMask = segmenter.update(video, video.videoWidth, video.videoHeight, stamp) ?? personMask;
-      depthEstimator?.submit(video, stamp);
-      updateControl(result.landmarks as Point[][], face, width, height);
     }
     renderOverlay(performance.now());
     animationFrame = requestAnimationFrame(predict);
@@ -876,6 +977,9 @@ export async function createHandTracker(
     setSafeMode(enabled) {
       if (!enabled || safeMode) return;
       safeMode = true;
+      enabledSubsystems.face = false;
+      enabledSubsystems.segmentation = false;
+      enabledSubsystems.depth = false;
       faceLandmarker?.close();
       faceLandmarker = null;
       faceTriangles = null;
@@ -888,12 +992,34 @@ export async function createHandTracker(
       depthMap = null;
       depthFit = null;
     },
+    setSubsystem(subsystem, enabled) {
+      if (safeMode && subsystem !== 'hands') return;
+      enabledSubsystems[subsystem] = enabled;
+      if (subsystem === 'hands' && !enabled) {
+        lastHandLandmarks = [];
+        updateControl([], enabledSubsystems.face ? lastFaceLandmarks : null, canvas.clientWidth || window.innerWidth, canvas.clientHeight || window.innerHeight);
+      }
+      if (subsystem === 'face' && !enabled) {
+        lastFaceLandmarks = null;
+        lastFaceMatrix = undefined;
+        if (lastHandLandmarks.length) updateControl(lastHandLandmarks, null, canvas.clientWidth || window.innerWidth, canvas.clientHeight || window.innerHeight);
+      }
+      if (subsystem === 'segmentation' && !enabled && lastHandLandmarks.length) {
+        updateControl(lastHandLandmarks, enabledSubsystems.face ? lastFaceLandmarks : null, canvas.clientWidth || window.innerWidth, canvas.clientHeight || window.innerHeight);
+      }
+      if (subsystem === 'depth' && !enabled && lastHandLandmarks.length) {
+        updateControl(lastHandLandmarks, enabledSubsystems.face ? lastFaceLandmarks : null, canvas.clientWidth || window.innerWidth, canvas.clientHeight || window.innerHeight);
+      }
+    },
     getDiagnostics() {
       return {
         segmentation: Boolean(segmenter),
         segmentationDelegate: segmenter?.delegate ?? 'off',
         depth: Boolean(depthEstimator),
         safeMode,
+        subsystems: Object.fromEntries(
+          (Object.keys(subsystemDiagnostics) as TrackerSubsystem[]).map((name) => [name, { ...subsystemDiagnostics[name] }]),
+        ) as Record<TrackerSubsystem, SubsystemDiagnostics>,
       };
     },
     destroy() {
