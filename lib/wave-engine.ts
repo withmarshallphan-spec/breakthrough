@@ -55,6 +55,7 @@ export type WaveEngineDiagnostics = {
   canvasBackingSize: string;
   renderTargets: string;
   lastCameraFrameAt: number;
+  lastSegmentationFrameAt: number;
   lastDepthFrameAt: number;
   lastRelightingFrameAt: number;
   nullTextureThisFrame: boolean;
@@ -456,7 +457,7 @@ const cameraFragmentShader = /* glsl */ `
   // DESATURATE 0, CONTRAST 1, EXPOSURE 1, VIGNETTE 0.
   const float ROOM_DESATURATE = .18;
   const float ROOM_CONTRAST = 1.08;
-  const float ROOM_EXPOSURE = .95;
+  const float ROOM_EXPOSURE = .92;
   const float ROOM_VIGNETTE = .24;
 
   void main() {
@@ -468,6 +469,11 @@ const cameraFragmentShader = /* glsl */ `
     float luma = dot(color, vec3(.299, .587, .114));
     color = mix(color, vec3(luma), ROOM_DESATURATE);
     color = max((color - .5) * ROOM_CONTRAST + .5, vec3(0.0));
+    // A webcam's clipped highlights have no extra detail to reveal. Compress
+    // them before they become albedo for the relighting pass, so a lamp does
+    // not turn into an unbounded synthetic light source.
+    float highlight = smoothstep(.58, 1.0, dot(color, vec3(.299, .587, .114)));
+    color *= 1.0 - highlight * .26;
     // This pass now yields albedo only: what the room reflects. How much light
     // reaches it is decided in the field pass, so the wave can be the room's
     // light rather than a layer painted over it.
@@ -631,17 +637,17 @@ const compositeFragmentShader = /* glsl */ `
 
   // How pronounced the inferred relief is. Higher shapes the subject harder
   // but starts turning albedo edges into fake geometry.
-  const float RELIEF = .24;
+  const float RELIEF = .16;
   // How hard the wave's own irradiance lights the room.
   // Calibrated against the measured buffer: a wide blur conserves energy, so
   // spreading the wave over the frame leaves irradiance around 0.01. The gain
   // has to be in the tens for the field to be the room's actual light source.
-  const float LIGHT_GAIN = 30.0;
+  const float LIGHT_GAIN = 16.0;
   // How hard light wraps a backlit silhouette.
-  const float RIM_GAIN = 2.1;
+  const float RIM_GAIN = 1.2;
   // How much of a sealed field escapes through the hands holding it. Same
   // scale as LIGHT_GAIN, because it reads the same irradiance buffer.
-  const float SEAL_TRANSMIT = 20.0;
+  const float SEAL_TRANSMIT = 10.0;
   // Over how much of the depth range the light falls to a quarter strength.
   // Depth is 0..1 nearness, derived from apparent size, so this is a real
   // distance falloff between the hands and the face behind them. Generous on
@@ -657,7 +663,7 @@ const compositeFragmentShader = /* glsl */ `
   const float NEAR_FIELD_RADIUS = 2.1;
   // How hard that near-field term lights the room, relative to the screen-space
   // irradiance it sits alongside.
-  const float MATCH_GAIN = 1.6;
+  const float MATCH_GAIN = .85;
 
   ${waveChunk}
   ${frameChunk}
@@ -687,9 +693,9 @@ const compositeFragmentShader = /* glsl */ `
       vec3 halo = texture2D(tLight, vUv).rgb;
       // Keep the fallback local and calm. Screen blending made the low-level
       // blur act like a flickering full-frame exposure adjustment on iPad.
-      vec3 overlay = emission * .92 + halo * 1.1 * uRelighting;
-      overlay = vec3(1.0) - exp(-overlay * .8);
-      float alpha = clamp(max(max(overlay.r, overlay.g), overlay.b) * .62, 0.0, .72);
+      vec3 overlay = emission * .68 + halo * .58 * uRelighting;
+      overlay = vec3(1.0) - exp(-overlay * .66);
+      float alpha = clamp(max(max(overlay.r, overlay.g), overlay.b) * .50, 0.0, .56);
       gl_FragColor = vec4(overlay, alpha);
       return;
     }
@@ -862,10 +868,10 @@ const compositeFragmentShader = /* glsl */ `
     // held back off fabric instead of washing the whole subject evenly.
     float skin = texture2D(tPerson, frameUv).g;
     float material = mix(1.0, .45 + .8 * skin, uHasSkin);
-    vec3 scattering = irradiance * depthFalloff * coverage * material * (1.3 + uEnergy * 2.6);
+    vec3 scattering = irradiance * depthFalloff * coverage * material * (.72 + uEnergy * 1.35);
     // Skin is not opaque; a near source bleeds a little through it wherever it
     // lands, which is what keeps the match light off the surface of a mask.
-    scattering += tint * matchLight * material * coverage * .22;
+    scattering += tint * matchLight * material * coverage * .12;
     vec3 color = albedo * (uAmbient + lit * uRelighting) + scattering * uRelighting;
     color += emissive;
 
@@ -1686,6 +1692,7 @@ export function createWaveEngine(
   let frame = 0;
   let lastVideoTime = -1;
   let lastCameraFrameAt = 0;
+  let lastSegmentationFrameAt = 0;
   let lastDepthFrameAt = 0;
   let lastRelightingFrameAt = 0;
   let nullTextureThisFrame = false;
@@ -2044,8 +2051,7 @@ export function createWaveEngine(
     }
     const pixels = mask.width * mask.height;
     const image = personTexture?.image as { width: number; height: number } | undefined;
-    if (!personTexture || image?.width !== mask.width || image?.height !== mask.height) {
-      personTexture?.dispose();
+    if (!personTexture) {
       personPacked = new Uint8Array(pixels * 2);
       personTexture = new THREE.DataTexture(personPacked, mask.width, mask.height, THREE.RGFormat);
       personTexture.minFilter = THREE.LinearFilter;
@@ -2055,6 +2061,10 @@ export function createWaveEngine(
       compositeMaterial.uniforms.tPerson.value = personTexture;
       personVersion = -1;
     }
+    // The segmenter pins its output dimensions for a stream. Should a browser
+    // still report a one-off mismatched mask, retain the previous valid GPU
+    // texture rather than disposing it in the middle of a composite frame.
+    if (image && (image.width !== mask.width || image.height !== mask.height)) return;
     if (mask.version !== personVersion) {
       personVersion = mask.version;
       for (let i = 0; i < pixels; i += 1) {
@@ -2062,6 +2072,7 @@ export function createWaveEngine(
         personPacked[i * 2 + 1] = mask.skin[i];
       }
       personTexture.needsUpdate = true;
+      lastSegmentationFrameAt = performance.now();
     }
     compositeMaterial.uniforms.uHasSkin.value = mask.multiclass ? 1 : 0;
     personMaterial.uniforms.uBodyDepth.value = bodyDepth;
@@ -2337,6 +2348,7 @@ export function createWaveEngine(
           targetSize('blur', blurTargets[1]),
         ].join(' '),
         lastCameraFrameAt,
+        lastSegmentationFrameAt,
         lastDepthFrameAt,
         lastRelightingFrameAt,
         nullTextureThisFrame,

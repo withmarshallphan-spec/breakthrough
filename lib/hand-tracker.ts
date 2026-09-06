@@ -103,7 +103,12 @@ export type HandTracker = {
   setDebug: (enabled: boolean) => void;
   setGuide: (enabled: boolean) => void;
   setSafeMode: (enabled: boolean) => void;
-  getDiagnostics: () => { segmentation: boolean; depth: boolean; safeMode: boolean };
+  getDiagnostics: () => {
+    segmentation: boolean;
+    segmentationDelegate: 'CPU' | 'off';
+    depth: boolean;
+    safeMode: boolean;
+  };
   destroy: () => void;
 };
 
@@ -710,7 +715,7 @@ export async function createHandTracker(
       dormant: 'Show one or two hands',
       open: `${label} · open`,
       compressing: `${label} · compressing`,
-      critical: `${label} · near collapse`,
+      critical: `${label} · compressed`,
       clasped: 'Sealed',
       release: `${label} · releasing`,
     };
@@ -884,7 +889,12 @@ export async function createHandTracker(
       depthFit = null;
     },
     getDiagnostics() {
-      return { segmentation: Boolean(segmenter), depth: Boolean(depthEstimator), safeMode };
+      return {
+        segmentation: Boolean(segmenter),
+        segmentationDelegate: segmenter?.delegate ?? 'off',
+        depth: Boolean(depthEstimator),
+        safeMode,
+      };
     },
     destroy() {
       destroyed = true;

@@ -143,7 +143,7 @@ export const STATE_NOTES: Record<FieldState, { title: string; note: string }> = 
     note: 'The well is narrowing. Spatial structure tightens and the momentum distribution widens with it.',
   },
   critical: {
-    title: 'Near collapse',
+    title: 'Compressed',
     note: 'The narrowest the state gets before the hands close on it. Short wavelengths, a wide momentum distribution, and the kinetic-energy cost near its maximum.',
   },
   clasped: {

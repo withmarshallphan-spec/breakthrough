@@ -29,6 +29,8 @@ export type PersonSegmenter = {
   /** Runs at most once per interval; returns the mask if it changed. */
   update: (source: CanvasImageSource, videoWidth: number, videoHeight: number, now: number) => PersonMask | null;
   readonly multiclass: boolean;
+  /** Kept explicit because sharing the compositor's GPU caused context loss. */
+  readonly delegate: 'CPU';
   destroy: () => void;
 };
 
@@ -84,26 +86,30 @@ export async function createPersonSegmenter(
 ): Promise<PersonSegmenter | null> {
   const { ImageSegmenter: Segmenter } = await import('@mediapipe/tasks-vision');
 
-  const attempt = async (modelAssetPath: string, delegate: 'GPU' | 'CPU') =>
+  const attempt = async (modelAssetPath: string) =>
     Segmenter.createFromOptions(vision, {
-      baseOptions: { modelAssetPath, delegate },
+      // The visual renderer, hand tracker, and a GPU segmenter can otherwise
+      // contend for the browser's video/GPU resources. That manifested as a
+      // periodic black composite and eventually a lost WebGL context. The
+      // silhouette is deliberately slow-moving, so CPU is the stable trade.
+      baseOptions: { modelAssetPath, delegate: 'CPU' },
       runningMode: 'VIDEO' as const,
       outputCategoryMask: true,
       outputConfidenceMasks: false,
     });
 
-  // Multiclass first when the tier asks for it, then the binary model, then
-  // CPU for each. Any success is enough; the silhouette matters more than the
-  // classes, which only refine how skin is lit.
-  const plans: [string, 'GPU' | 'CPU', boolean][] = preferMulticlass
-    ? [[MULTICLASS_MODEL, 'GPU', true], [BINARY_MODEL, 'GPU', false], [MULTICLASS_MODEL, 'CPU', true], [BINARY_MODEL, 'CPU', false]]
-    : [[BINARY_MODEL, 'GPU', false], [BINARY_MODEL, 'CPU', false]];
+  // A CPU segmenter cannot interrupt a WebGL render target or steal the
+  // camera texture. Prefer the richer model where the quality tier allows it,
+  // then fall back to the binary silhouette.
+  const plans: [string, boolean][] = preferMulticlass
+    ? [[MULTICLASS_MODEL, true], [BINARY_MODEL, false]]
+    : [[BINARY_MODEL, false]];
 
   let segmenter: ImageSegmenter | null = null;
   let multiclass = false;
-  for (const [model, delegate, isMulticlass] of plans) {
+  for (const [model, isMulticlass] of plans) {
     try {
-      segmenter = await attempt(model, delegate);
+      segmenter = await attempt(model);
       multiclass = isMulticlass;
       break;
     } catch {
@@ -127,27 +133,32 @@ export async function createPersonSegmenter(
   let skinHistory = new Uint8Array(0);
   let hasHistory = false;
   let lastRun = -Infinity;
+  let stableInputHeight = 0;
   // Segmentation is the slowest of the MediaPipe models and the silhouette is
-  // the slowest-changing signal, so it runs on its own clock and backs off
-  // further if a call turns out to be expensive on this machine.
-  let interval = 90;
+  // the slowest-changing signal. A fixed input shape also means the Three
+  // texture is allocated once and never swaps underneath a live render pass.
+  let interval = 250;
   let failures = 0;
 
   return {
     get multiclass() { return multiclass; },
+    get delegate() { return 'CPU' as const; },
     update(source, videoWidth, videoHeight, now) {
       if (failures > 3 || now - lastRun < interval || videoWidth < 2 || videoHeight < 2) return null;
       lastRun = now;
 
-      const height = Math.max(2, Math.round(MASK_WIDTH * videoHeight / videoWidth));
-      if (scratchCanvas.width !== MASK_WIDTH || scratchCanvas.height !== height) {
+      // Camera constraints are stable for a stream. Pin the segmenter's input
+      // shape on the first decoded frame rather than reallocating a canvas and
+      // mask texture if a browser reports a transient size during warm-up.
+      stableInputHeight ||= Math.max(2, Math.round(MASK_WIDTH * videoHeight / videoWidth));
+      if (scratchCanvas.width !== MASK_WIDTH || scratchCanvas.height !== stableInputHeight) {
         scratchCanvas.width = MASK_WIDTH;
-        scratchCanvas.height = height;
+        scratchCanvas.height = stableInputHeight;
       }
       const started = performance.now();
       let result;
       try {
-        scratchContext.drawImage(source, 0, 0, MASK_WIDTH, height);
+        scratchContext.drawImage(source, 0, 0, MASK_WIDTH, stableInputHeight);
         result = active.segmentForVideo(scratchCanvas, now);
       } catch {
         failures += 1;
@@ -201,8 +212,8 @@ export async function createPersonSegmenter(
       mask.version += 1;
 
       const cost = performance.now() - started;
-      if (cost > 14) interval = Math.min(interval * 1.35, 400);
-      else if (cost < 7) interval = Math.max(interval * .94, 80);
+      if (cost > 18) interval = Math.min(interval * 1.35, 800);
+      else if (cost < 9) interval = Math.max(interval * .94, 220);
       return mask;
     },
     destroy() {
